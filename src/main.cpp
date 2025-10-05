@@ -26,24 +26,6 @@ float readBatteryVoltage() {
   return voltage;
 }
 
-void drawTempStats(float tMin, float tMax, float median) {
-  char buf[32];
-
-  // Position in bottom-left corner relative to current rotation
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  int textY = tft.height() - 45;  // roughly above bottom edge
-  int textX = 5;
-
-  snprintf(buf, sizeof(buf), "Min: %.1f", tMin);
-  tft.drawString(buf, textX, textY, 2);
-
-  snprintf(buf, sizeof(buf), "Max: %.1f", tMax);
-  tft.drawString(buf, textX, textY + 15, 2);
-
-  snprintf(buf, sizeof(buf), "Med: %.1f", median);
-  tft.drawString(buf, textX, textY + 30, 2);
-}
-
 void drawBatteryIndicator(int x, int y, int w, int h, float voltage) {
   // Clear the area to reduce flicker
   int clearW = w + 44; // battery + text
@@ -81,7 +63,7 @@ float interpBuf[INTERP_W * INTERP_H];
 bool useInterpolation = true;
 bool useManualRange = false;
 float manualMin = 20.0f;
-float manualMax = 30.0f;
+float manualMax = 40.0f;
 
 // ------------- Power Off -------------
 void powerOff() {
@@ -131,20 +113,6 @@ unsigned long interpPressStart = 0;
 bool lastRangeState = HIGH;
 unsigned long lastRangeToggle = 0;
 
-#include <algorithm>
-
-float computeMedian(float *arr, int n) {
-  // Copy to temp array so we don't modify original
-  float temp[AMG88xx_PIXEL_ARRAY_SIZE];
-  memcpy(temp, arr, n * sizeof(float));
-  std::sort(temp, temp + n);
-  if (n % 2 == 0) {
-    return 0.5f * (temp[n/2 - 1] + temp[n/2]);
-  } else {
-    return temp[n/2];
-  }
-}
-
 void checkButtons() {
   // Interpolation button (GPIO0)
   int interpReading = digitalRead(BUTTON_INTERP);
@@ -169,6 +137,38 @@ void checkButtons() {
     lastRangeToggle = millis();
   }
   lastRangeState = rangeReading;
+}
+
+#include <algorithm>
+
+float computeMedian(float *arr, int n) {
+  // Copy to temp array so we don't modify original
+  float temp[AMG88xx_PIXEL_ARRAY_SIZE];
+  memcpy(temp, arr, n * sizeof(float));
+  std::sort(temp, temp + n);
+  if (n % 2 == 0) {
+    return 0.5f * (temp[n/2 - 1] + temp[n/2]);
+  } else {
+    return temp[n/2];
+  }
+}
+
+void drawTempStats(float tMin, float tMax, float median) {
+  char buf[32];
+
+  // Position in bottom-left corner relative to current rotation
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  int textY = tft.height() - 45;  // roughly above bottom edge
+  int textX = 5;
+
+  snprintf(buf, sizeof(buf), "Min: %.1f", tMin);
+  tft.drawString(buf, textX, textY, 2);
+
+  snprintf(buf, sizeof(buf), "Max: %.1f", tMax);
+  tft.drawString(buf, textX, textY + 15, 2);
+
+  snprintf(buf, sizeof(buf), "Med: %.1f", median);
+  tft.drawString(buf, textX, textY + 30, 2);
 }
 
 // ------------- Drawing -------------
@@ -280,21 +280,6 @@ void loop() {
 
   checkButtons();
 
-  if (useInterpolation) {
-    bilinearInterpolate(pixels, interpBuf, GRID_W, GRID_H, UPSCALE);
-    drawInterpolatedHeatmap(interpBuf, tMin, tMax);
-  } else {
-    drawHeatmap(pixels, tMin, tMax);
-  }
-
-// Save current rotation
-// uint8_t prevRot = tft.getRotation();
-
-// Set rotation to match the image rotation for overlay drawing
-tft.setRotation(1);
-
-
-  // Calculate median temperature
   float medianTemp = computeMedian(pixels, AMG88xx_PIXEL_ARRAY_SIZE);
 
   if (useInterpolation) {
@@ -304,28 +289,25 @@ tft.setRotation(1);
     drawHeatmap(pixels, tMin, tMax);
   }
 
-  // Draw temp stats overlay
-  drawTempStats(tMin, tMax, medianTemp);
+// Save current rotation
+uint8_t prevRot = tft.getRotation();
 
-  // Draw battery overlay (same rotation trick)
-  uint8_t prevRot = tft.getRotation();
-  tft.setRotation(1);
+// Set rotation to match the image rotation for overlay drawing
+tft.setRotation(1);
+
+drawTempStats(tMin, tMax, medianTemp);
+
+// Draw battery indicator (always top-right in current orientation)
   float battV = readBatteryVoltage();
   int battW = 32, battH = 14;
-  int battX = tft.width() - battW - 6;
-  int battY = 6;
-  drawBatteryIndicator(battX, battY, battW, battH, battV);
-  tft.setRotation(prevRot);
 
-// Draw battery indicator (relative to rotated coordinates)
-// float battV = readBatteryVoltage();
-// int battW = 32, battH = 14;
-// int battX = tft.width() - battW - 6;
-// int battY = 6;
-// drawBatteryIndicator(battX, battY, battW, battH, battV);
+// Use TFT_eSPI's width/height for current rotation
+  int battX = tft.width() - battW - 6;  // 6px margin from right
+  int battY = 6;                        // 6px margin from top
+
+drawBatteryIndicator(battX, battY, battW, battH, battV);
 
 // Restore original rotation
 tft.setRotation(prevRot);
-
   delay(60);
 }
