@@ -63,7 +63,7 @@ float interpBuf[INTERP_W * INTERP_H];
 bool useInterpolation = true;
 bool useManualRange = false;
 float manualMin = 20.0f;
-float manualMax = 40.0f;
+float manualMax = 30.0f;
 
 // ------------- Power Off -------------
 void powerOff() {
