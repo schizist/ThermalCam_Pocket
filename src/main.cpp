@@ -10,8 +10,46 @@ float pixels[AMG88xx_PIXEL_ARRAY_SIZE];
 const int GRID_W = 8;
 const int GRID_H = 8;
 
+
 #define SCREEN_W 240
 #define SCREEN_H 135
+
+// Battery voltage reading
+#define BATTERY_PIN 34  // GPIO34 (ADC1_CH6)
+#define BATTERY_VOLTAGE_DIVIDER 2.0f // Adjust if using a resistor divider
+#define BATTERY_MIN_V 3.2f  // Minimum voltage (empty)
+#define BATTERY_MAX_V 4.2f  // Maximum voltage (full)
+// ------------- Battery Indicator -------------
+float readBatteryVoltage() {
+  int raw = analogRead(BATTERY_PIN);
+  float voltage = (raw / 4095.0f) * 3.3f * BATTERY_VOLTAGE_DIVIDER;
+  return voltage;
+}
+
+void drawBatteryIndicator(int x, int y, int w, int h, float voltage) {
+  // Clear the area to reduce flicker
+  int clearW = w + 44; // battery + text
+  int clearH = h;
+  tft.fillRect(x - 44, y, clearW, clearH, TFT_BLACK);
+
+  float pct = (voltage - BATTERY_MIN_V) / (BATTERY_MAX_V - BATTERY_MIN_V);
+  if (pct < 0) pct = 0;
+  if (pct > 1) pct = 1;
+  int fillW = (int)((w - 4) * pct);
+  // Draw battery outline
+  tft.drawRect(x, y, w, h, TFT_WHITE);
+  tft.fillRect(x + w, y + h/4, 3, h/2, TFT_WHITE); // battery tip
+  // Fill level
+  uint16_t fillColor = (pct > 0.2f) ? TFT_GREEN : TFT_RED;
+  tft.fillRect(x + 2, y + 2, fillW, h - 4, fillColor);
+  // Voltage text (to the left of the battery, right-aligned)
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%.2fV", voltage);
+  int textX = x - 2 - tft.textWidth(buf, 2);
+  int textY = y + (h - 16) / 2;
+  tft.drawString(buf, textX, textY, 2);
+}
 
 #define UPSCALE 8
 const int INTERP_W = GRID_W * UPSCALE;
@@ -171,6 +209,9 @@ void setup() {
   tft.setRotation(3);
   tft.fillScreen(TFT_BLACK);
 
+  analogReadResolution(12); // 12-bit ADC
+  pinMode(BATTERY_PIN, INPUT);
+
   if (!amg.begin()) {
     tft.setTextColor(TFT_RED);
     tft.drawString("AMG8833 not found!", 10, 10, 2);
@@ -213,6 +254,22 @@ void loop() {
   } else {
     drawHeatmap(pixels, tMin, tMax);
   }
+
+// Save current rotation
+uint8_t prevRot = tft.getRotation();
+
+// Set rotation to match the image rotation for overlay drawing
+tft.setRotation(1);
+
+// Draw battery indicator (relative to rotated coordinates)
+float battV = readBatteryVoltage();
+int battW = 32, battH = 14;
+int battX = tft.width() - battW - 6;
+int battY = 6;
+drawBatteryIndicator(battX, battY, battW, battH, battV);
+
+// Restore original rotation
+tft.setRotation(prevRot);
 
   delay(60);
 }
