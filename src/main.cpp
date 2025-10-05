@@ -42,10 +42,13 @@ void drawBatteryIndicator(int x, int y, int w, int h, float voltage) {
   // Fill level
   uint16_t fillColor = (pct > 0.2f) ? TFT_GREEN : TFT_RED;
   tft.fillRect(x + 2, y + 2, fillW, h - 4, fillColor);
-  // Voltage text (to the left of the battery, right-aligned)
+  // Percentage text (to the left of the battery, right-aligned)
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   char buf[8];
-  snprintf(buf, sizeof(buf), "%.2fV", voltage);
+  int percent = (int)(pct * 100.0f + 0.5f);
+  if (percent > 100) percent = 100;
+  if (percent < 0) percent = 0;
+  snprintf(buf, sizeof(buf), "%d%%", percent);
   int textX = x - 2 - tft.textWidth(buf, 2);
   int textY = y + (h - 16) / 2;
   tft.drawString(buf, textX, textY, 2);
