@@ -1,6 +1,20 @@
 #include <Wire.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ArduinoJson.h>
+#include <algorithm>
 #include <Adafruit_AMG88xx.h>
 #include <TFT_eSPI.h>
+
+#ifndef WIFI_SSID
+#define WIFI_SSID "YOUR_WIFI_SSID"
+#endif
+
+#ifndef WIFI_PASSWORD
+#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+#endif
+
+WebServer server(80);
 
 TFT_eSPI tft = TFT_eSPI();  
 Adafruit_AMG88xx amg;
@@ -69,11 +83,409 @@ bool useManualRange = false;
 float manualMin = 20.0f;
 float manualMax = 40.0f;
 
+bool autoRangeInitialized = false;
+float smoothRangeMin = 0.0f;
+float smoothRangeMax = 0.0f;
+
 const float AMBIENT_DEADBAND = 0.8f;
 const float AUTO_RANGE_PAD = 0.4f;
 const float MIN_AUTO_RANGE = 1.0f;
 const float RANGE_EXPAND_RATE = 0.55f;
 const float RANGE_CONTRACT_RATE = 0.18f;
+
+bool frameAvailable = false;
+float latestFrame[AMG88xx_PIXEL_ARRAY_SIZE];
+float latestFrameMin = 0.0f;
+float latestFrameMax = 0.0f;
+float latestFrameMedian = 0.0f;
+unsigned long latestFrameMillis = 0;
+String deviceIp;
+
+const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ThermalCam Live Viewer</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+    }
+    body {
+      margin: 0 auto;
+      max-width: 960px;
+      padding: 1.5rem;
+      background: #111;
+      color: #f0f0f0;
+    }
+    h1 {
+      font-weight: 600;
+      margin-bottom: 1rem;
+      text-align: center;
+    }
+    .viewer {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 1.5rem;
+      justify-content: center;
+      align-items: flex-start;
+    }
+    canvas {
+      border: 1px solid #2f2f2f;
+      border-radius: 8px;
+      width: min(90vw, 320px);
+      height: min(90vw, 320px);
+      image-rendering: pixelated;
+      background: #000;
+    }
+    .panel {
+      background: rgba(32, 32, 32, 0.8);
+      border-radius: 12px;
+      padding: 1rem 1.25rem;
+      min-width: 280px;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+    }
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+      gap: 0.75rem;
+      margin-bottom: 1rem;
+    }
+    .stat {
+      background: rgba(255, 255, 255, 0.04);
+      border-radius: 8px;
+      padding: 0.75rem;
+      text-align: center;
+    }
+    .stat span {
+      display: block;
+      font-size: 1.35rem;
+      font-weight: 600;
+      margin-top: 0.25rem;
+    }
+    label {
+      display: flex;
+      flex-direction: column;
+      gap: 0.35rem;
+      margin-bottom: 1rem;
+      font-size: 0.95rem;
+    }
+    input[type="range"] {
+      width: 100%;
+    }
+    .toggle-row {
+      display: flex;
+      gap: 1rem;
+      margin-bottom: 1rem;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .toggle-row label {
+      flex-direction: row;
+      align-items: center;
+      gap: 0.5rem;
+      margin: 0;
+    }
+    .status {
+      font-size: 0.9rem;
+      opacity: 0.8;
+    }
+  </style>
+</head>
+<body>
+  <h1>ThermalCam Live Viewer</h1>
+  <div class="viewer">
+    <canvas id="heatmap" width="320" height="320"></canvas>
+    <div class="panel">
+      <div class="stats">
+        <div class="stat">Min<span id="stat-min">--</span></div>
+        <div class="stat">Median<span id="stat-median">--</span></div>
+        <div class="stat">Max<span id="stat-max">--</span></div>
+      </div>
+      <div class="toggle-row">
+        <label><input type="checkbox" id="toggleManual"> Manual range</label>
+        <label><input type="checkbox" id="toggleInterp"> Interpolation</label>
+      </div>
+      <label for="sliderMin">Manual minimum: <strong><span id="sliderMinValue">--</span> °C</strong>
+        <input type="range" id="sliderMin" min="-20" max="120" step="0.1">
+      </label>
+      <label for="sliderMax">Manual maximum: <strong><span id="sliderMaxValue">--</span> °C</strong>
+        <input type="range" id="sliderMax" min="-20" max="120" step="0.1">
+      </label>
+      <div class="status">IP address: <span id="ip-address">retrieving…</span></div>
+      <div class="status">Last frame: <span id="last-frame">--</span></div>
+    </div>
+  </div>
+  <script>
+    const heatmap = document.getElementById('heatmap');
+    const ctx = heatmap.getContext('2d');
+    const statMin = document.getElementById('stat-min');
+    const statMax = document.getElementById('stat-max');
+    const statMedian = document.getElementById('stat-median');
+    const sliderMin = document.getElementById('sliderMin');
+    const sliderMax = document.getElementById('sliderMax');
+    const sliderMinValue = document.getElementById('sliderMinValue');
+    const sliderMaxValue = document.getElementById('sliderMaxValue');
+    const toggleManual = document.getElementById('toggleManual');
+    const toggleInterp = document.getElementById('toggleInterp');
+    const ipAddress = document.getElementById('ip-address');
+    const lastFrame = document.getElementById('last-frame');
+
+    let pendingSettings = {};
+    let pendingTimeout = null;
+    let lastFrameReceived = 0;
+
+    function queueSettingUpdate(key, value) {
+      pendingSettings[key] = value;
+      if (pendingTimeout) {
+        return;
+      }
+      pendingTimeout = setTimeout(() => {
+        fetch('/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(pendingSettings)
+        }).catch(console.error);
+        pendingSettings = {};
+        pendingTimeout = null;
+      }, 150);
+    }
+
+    function updateFrameAge() {
+      if (!lastFrameReceived) {
+        lastFrame.textContent = '--';
+        return;
+      }
+      const seconds = (Date.now() - lastFrameReceived) / 1000;
+      if (seconds < 0.5) {
+        lastFrame.textContent = 'just now';
+      } else {
+        lastFrame.textContent = `${seconds.toFixed(1)} s ago`;
+      }
+    }
+
+    function gammaAdjust(ratio, gamma) {
+      ratio = Math.min(Math.max(ratio, 0), 1);
+      return Math.pow(ratio, gamma);
+    }
+
+    function thermalGradient(ratio) {
+      ratio = Math.min(Math.max(ratio, 0), 1);
+      let r = 0, g = 0, b = 0;
+      if (ratio <= 0.25) {
+        const f = ratio / 0.25;
+        g = Math.round(255 * f);
+        b = 255;
+      } else if (ratio <= 0.5) {
+        const f = (ratio - 0.25) / 0.25;
+        g = 255;
+        b = Math.round(255 * (1 - f));
+      } else if (ratio <= 0.75) {
+        const f = (ratio - 0.5) / 0.25;
+        r = Math.round(255 * f);
+        g = 255;
+      } else {
+        const f = (ratio - 0.75) / 0.25;
+        r = 255;
+        g = Math.round(255 * (1 - f));
+      }
+      return `rgb(${r}, ${g}, ${b})`;
+    }
+
+    function drawHeatmap(pixels, minT, maxT) {
+      const cellW = heatmap.width / 8;
+      const cellH = heatmap.height / 8;
+      ctx.clearRect(0, 0, heatmap.width, heatmap.height);
+      for (let y = 0; y < 8; y++) {
+        for (let x = 0; x < 8; x++) {
+          const temp = pixels[y * 8 + x];
+          const ratio = (temp - minT) / (maxT - minT || 1);
+          const color = thermalGradient(gammaAdjust(ratio, 0.6));
+          ctx.fillStyle = color;
+          ctx.fillRect(x * cellW, y * cellH, cellW, cellH);
+        }
+      }
+    }
+
+    function updateSliders(data) {
+      if (document.activeElement !== sliderMin) {
+        sliderMin.value = data.manualMin.toFixed(1);
+      }
+      if (document.activeElement !== sliderMax) {
+        sliderMax.value = data.manualMax.toFixed(1);
+      }
+      sliderMinValue.textContent = Number(sliderMin.value).toFixed(1);
+      sliderMaxValue.textContent = Number(sliderMax.value).toFixed(1);
+      sliderMin.disabled = !data.useManualRange;
+      sliderMax.disabled = !data.useManualRange;
+      toggleManual.checked = data.useManualRange;
+      toggleInterp.checked = data.useInterpolation;
+    }
+
+    function fetchFrame() {
+      fetch('/frame')
+        .then(r => r.json())
+        .then(data => {
+          if (!data.frameReady) {
+            return;
+          }
+          drawHeatmap(data.pixels, data.tMin, data.tMax);
+          statMin.textContent = `${data.tMin.toFixed(1)} °C`;
+          statMax.textContent = `${data.tMax.toFixed(1)} °C`;
+          statMedian.textContent = `${data.median.toFixed(1)} °C`;
+          lastFrameReceived = Date.now();
+          updateFrameAge();
+          ipAddress.textContent = data.ip || ipAddress.textContent;
+          updateSliders(data);
+        })
+        .catch(err => {
+          console.error(err);
+          lastFrameReceived = 0;
+          lastFrame.textContent = 'disconnected';
+        });
+    }
+
+    toggleManual.addEventListener('change', () => {
+      queueSettingUpdate('useManualRange', toggleManual.checked);
+      sliderMin.disabled = sliderMax.disabled = !toggleManual.checked;
+    });
+
+    toggleInterp.addEventListener('change', () => {
+      queueSettingUpdate('useInterpolation', toggleInterp.checked);
+    });
+
+    sliderMin.addEventListener('input', () => {
+      const minValue = Number(sliderMin.value);
+      sliderMinValue.textContent = minValue.toFixed(1);
+      queueSettingUpdate('manualMin', minValue);
+    });
+
+    sliderMax.addEventListener('input', () => {
+      const maxValue = Number(sliderMax.value);
+      sliderMaxValue.textContent = maxValue.toFixed(1);
+      queueSettingUpdate('manualMax', maxValue);
+    });
+
+    function refreshSettings() {
+      fetch('/settings')
+        .then(r => r.json())
+        .then(data => {
+          updateSliders(data);
+          ipAddress.textContent = data.ip || ipAddress.textContent;
+        })
+        .catch(console.error);
+    }
+
+    refreshSettings();
+    fetchFrame();
+    setInterval(fetchFrame, 400);
+    setInterval(updateFrameAge, 250);
+  </script>
+</body>
+</html>
+)rawliteral";
+
+void sendJson(const JsonDocument &doc) {
+  String payload;
+  serializeJson(doc, payload);
+  server.send(200, "application/json", payload);
+}
+
+void sendJsonError(int code, const char *message) {
+  StaticJsonDocument<128> doc;
+  doc["error"] = message;
+  String payload;
+  serializeJson(doc, payload);
+  server.send(code, "application/json", payload);
+}
+
+void handleIndex() {
+  server.send_P(200, "text/html", INDEX_HTML);
+}
+
+void handleFrame() {
+  StaticJsonDocument<4096> doc;
+  doc["frameReady"] = frameAvailable;
+  doc["ip"] = deviceIp;
+  doc["useInterpolation"] = useInterpolation;
+  doc["useManualRange"] = useManualRange;
+  doc["manualMin"] = manualMin;
+  doc["manualMax"] = manualMax;
+  if (frameAvailable) {
+    doc["timestamp"] = latestFrameMillis;
+    doc["tMin"] = latestFrameMin;
+    doc["tMax"] = latestFrameMax;
+    doc["median"] = latestFrameMedian;
+    JsonArray arr = doc.createNestedArray("pixels");
+    for (int i = 0; i < AMG88xx_PIXEL_ARRAY_SIZE; i++) {
+      arr.add(latestFrame[i]);
+    }
+  } else {
+    doc["timestamp"] = 0;
+    doc["tMin"] = manualMin;
+    doc["tMax"] = manualMax;
+    doc["median"] = 0;
+    doc.createNestedArray("pixels");
+  }
+  sendJson(doc);
+}
+
+void handleSettingsGet() {
+  StaticJsonDocument<256> doc;
+  doc["manualMin"] = manualMin;
+  doc["manualMax"] = manualMax;
+  doc["useManualRange"] = useManualRange;
+  doc["useInterpolation"] = useInterpolation;
+  doc["ip"] = deviceIp;
+  sendJson(doc);
+}
+
+void handleSettingsPost() {
+  if (!server.hasArg("plain")) {
+    sendJsonError(400, "Missing body");
+    return;
+  }
+
+  StaticJsonDocument<512> doc;
+  DeserializationError err = deserializeJson(doc, server.arg("plain"));
+  if (err) {
+    sendJsonError(400, "Invalid JSON");
+    return;
+  }
+
+  bool rangeChanged = false;
+  if (doc.containsKey("manualMin")) {
+    manualMin = doc["manualMin"].as<float>();
+    rangeChanged = true;
+  }
+  if (doc.containsKey("manualMax")) {
+    manualMax = doc["manualMax"].as<float>();
+    rangeChanged = true;
+  }
+  if (rangeChanged && manualMax - manualMin < 0.1f) {
+    manualMax = manualMin + 0.1f;
+  }
+
+  if (doc.containsKey("useManualRange")) {
+    bool newMode = doc["useManualRange"].as<bool>();
+    if (newMode != useManualRange) {
+      useManualRange = newMode;
+      autoRangeInitialized = false;
+    }
+  }
+
+  if (doc.containsKey("useInterpolation")) {
+    useInterpolation = doc["useInterpolation"].as<bool>();
+  }
+
+  handleSettingsGet();
+}
+
+void handleNotFound() {
+  server.send(404, "text/plain", "Not found");
+}
 
 // ------------- Power Off -------------
 void powerOff() {
@@ -123,10 +535,6 @@ unsigned long interpPressStart = 0;
 bool lastRangeState = HIGH;
 unsigned long lastRangeToggle = 0;
 
-bool autoRangeInitialized = false;
-float smoothRangeMin = 0.0f;
-float smoothRangeMax = 0.0f;
-
 void checkButtons() {
   // Interpolation button (GPIO0)
   int interpReading = digitalRead(BUTTON_INTERP);
@@ -153,8 +561,6 @@ void checkButtons() {
   }
   lastRangeState = rangeReading;
 }
-
-#include <algorithm>
 
 float computeMedian(float *arr, int n) {
   // Copy to temp array so we don't modify original
@@ -327,11 +733,56 @@ void setup() {
 
   tft.setTextColor(TFT_WHITE);
   tft.drawString("Thermal Imager Init OK", 10, 10, 2);
+  tft.drawString("Connecting WiFi...", 10, 30, 2);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to WiFi");
+  unsigned long wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 20000) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    deviceIp = WiFi.localIP().toString();
+    Serial.print("WiFi connected, IP: ");
+    Serial.println(deviceIp);
+    tft.fillRect(0, 30, SCREEN_W, 40, TFT_BLACK);
+    tft.drawString("WiFi connected", 10, 30, 2);
+    String ipText = "IP: " + deviceIp;
+    tft.drawString(ipText.c_str(), 10, 50, 2);
+  } else {
+    deviceIp = "not connected";
+    Serial.println("WiFi connection failed");
+    tft.fillRect(0, 30, SCREEN_W, 40, TFT_BLACK);
+    tft.drawString("WiFi failed", 10, 30, 2);
+  }
+
+  server.on("/", handleIndex);
+  server.on("/frame", HTTP_GET, handleFrame);
+  server.on("/settings", HTTP_GET, handleSettingsGet);
+  server.on("/settings", HTTP_POST, handleSettingsPost);
+  server.onNotFound(handleNotFound);
+  server.begin();
+
   delay(1000);
   tft.fillScreen(TFT_BLACK);
 }
 
 void loop() {
+  server.handleClient();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    String currentIp = WiFi.localIP().toString();
+    if (currentIp != deviceIp) {
+      deviceIp = currentIp;
+    }
+  } else {
+    deviceIp = "not connected";
+  }
+
   amg.readPixels(pixels);
 
   float medianTemp = computeMedian(pixels, AMG88xx_PIXEL_ARRAY_SIZE);
@@ -354,6 +805,15 @@ void loop() {
   }
 
   checkButtons();
+
+  for (int i = 0; i < AMG88xx_PIXEL_ARRAY_SIZE; i++) {
+    latestFrame[i] = framePixels[i];
+  }
+  latestFrameMin = tMin;
+  latestFrameMax = tMax;
+  latestFrameMedian = medianTemp;
+  latestFrameMillis = millis();
+  frameAvailable = true;
 
   if (useInterpolation) {
     bilinearInterpolate(framePixels, interpBuf, GRID_W, GRID_H, UPSCALE);
@@ -382,6 +842,9 @@ void loop() {
 
   // Restore original rotation
   tft.setRotation(prevRot);
-  delay(45);
-  delay(60);
+
+  for (int i = 0; i < 6; i++) {
+    server.handleClient();
+    delay(15);
+  }
 }
