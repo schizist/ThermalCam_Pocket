@@ -104,6 +104,12 @@ const float MIN_AUTO_RANGE = 0.8f;
 const float RANGE_EXPAND_RATE = 0.58f;
 const float RANGE_CONTRACT_RATE = 0.16f;
 
+const float AMBIENT_DEADBAND = 0.8f;
+const float AUTO_RANGE_PAD = 0.4f;
+const float MIN_AUTO_RANGE = 1.0f;
+const float RANGE_EXPAND_RATE = 0.55f;
+const float RANGE_CONTRACT_RATE = 0.18f;
+
 // ------------- Power Off -------------
 void powerOff() {
   tft.writecommand(ST7789_DISPOFF);
@@ -295,6 +301,63 @@ void applyRangeSmoothing(float targetMin, float targetMax, float *outMin, float 
   *outMax = smoothRangeMax;
 }
 
+float suppressAmbientNoise(float value, float ambient) {
+  float diff = value - ambient;
+  if (diff > AMBIENT_DEADBAND) {
+    return ambient + (diff - AMBIENT_DEADBAND);
+  }
+  if (diff < -AMBIENT_DEADBAND) {
+    return ambient + (diff + AMBIENT_DEADBAND);
+  }
+  return ambient;
+}
+
+void computeDisplayRange(const float *data, int count, float *outMin, float *outMax) {
+  if (count <= 0) {
+    *outMin = 0.0f;
+    *outMax = 1.0f;
+    return;
+  }
+
+  float minVal = data[0];
+  float maxVal = data[0];
+  for (int i = 1; i < count; i++) {
+    if (data[i] < minVal) minVal = data[i];
+    if (data[i] > maxVal) maxVal = data[i];
+  }
+
+  if (maxVal - minVal < MIN_AUTO_RANGE) {
+    float mid = 0.5f * (maxVal + minVal);
+    minVal = mid - MIN_AUTO_RANGE * 0.5f;
+    maxVal = mid + MIN_AUTO_RANGE * 0.5f;
+  }
+
+  *outMin = minVal - AUTO_RANGE_PAD;
+  *outMax = maxVal + AUTO_RANGE_PAD;
+}
+
+void applyRangeSmoothing(float targetMin, float targetMax, float *outMin, float *outMax) {
+  if (!autoRangeInitialized) {
+    smoothRangeMin = targetMin;
+    smoothRangeMax = targetMax;
+    autoRangeInitialized = true;
+  } else {
+    float expandMinRate = (targetMin < smoothRangeMin) ? RANGE_EXPAND_RATE : RANGE_CONTRACT_RATE;
+    float expandMaxRate = (targetMax > smoothRangeMax) ? RANGE_EXPAND_RATE : RANGE_CONTRACT_RATE;
+    smoothRangeMin += (targetMin - smoothRangeMin) * expandMinRate;
+    smoothRangeMax += (targetMax - smoothRangeMax) * expandMaxRate;
+
+    if (smoothRangeMax - smoothRangeMin < MIN_AUTO_RANGE) {
+      float mid = 0.5f * (smoothRangeMin + smoothRangeMax);
+      smoothRangeMin = mid - MIN_AUTO_RANGE * 0.5f;
+      smoothRangeMax = mid + MIN_AUTO_RANGE * 0.5f;
+    }
+  }
+
+  *outMin = smoothRangeMin;
+  *outMax = smoothRangeMax;
+}
+
 // ------------- Drawing -------------
 void drawInterpolatedHeatmap(const float *pix, float tMin, float tMax) {
   int W = tft.width();
@@ -401,6 +464,8 @@ void loop() {
     framePixels = displayPixels;
     computeDisplayRange(displayPixels, AMG88xx_PIXEL_ARRAY_SIZE, &targetMin, &targetMax);
     applyRangeSmoothing(targetMin, targetMax, &tMin, &tMax);
+    framePixels = displayPixels;
+    computeDisplayRange(displayPixels, AMG88xx_PIXEL_ARRAY_SIZE, &tMin, &tMax);
   }
 
   checkButtons();
@@ -433,4 +498,5 @@ void loop() {
   // Restore original rotation
   tft.setRotation(prevRot);
   delay(45);
+  delay(60);
 }
