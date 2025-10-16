@@ -66,11 +66,11 @@ float interpBuf[INTERP_W * INTERP_H];
 
 bool useInterpolation = true;
 bool useManualRange = false;
-float manualMin = 20.0f;
-float manualMax = 40.0f;
+float manualMin = 18.0f;
+float manualMax = 30.0f;
 
-const float AMBIENT_DEADBAND = 0.8f;
-const float AUTO_RANGE_PAD = 0.4f;
+const float AMBIENT_DEADBAND = 0.5f;
+const float AUTO_RANGE_PAD = 0.1f;
 const float MIN_AUTO_RANGE = 1.0f;
 const float RANGE_EXPAND_RATE = 0.55f;
 const float RANGE_CONTRACT_RATE = 0.18f;
