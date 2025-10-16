@@ -349,6 +349,8 @@ void loop() {
     framePixels = displayPixels;
     computeDisplayRange(displayPixels, AMG88xx_PIXEL_ARRAY_SIZE, &targetMin, &targetMax);
     applyRangeSmoothing(targetMin, targetMax, &tMin, &tMax);
+    framePixels = displayPixels;
+    computeDisplayRange(displayPixels, AMG88xx_PIXEL_ARRAY_SIZE, &tMin, &tMax);
   }
 
   checkButtons();
@@ -381,4 +383,5 @@ void loop() {
   // Restore original rotation
   tft.setRotation(prevRot);
   delay(45);
+  delay(60);
 }
