@@ -72,6 +72,8 @@ float manualMax = 40.0f;
 const float AMBIENT_DEADBAND = 0.8f;
 const float AUTO_RANGE_PAD = 0.4f;
 const float MIN_AUTO_RANGE = 1.0f;
+const float RANGE_EXPAND_RATE = 0.55f;
+const float RANGE_CONTRACT_RATE = 0.18f;
 
 // ------------- Power Off -------------
 void powerOff() {
@@ -121,6 +123,10 @@ unsigned long interpPressStart = 0;
 bool lastRangeState = HIGH;
 unsigned long lastRangeToggle = 0;
 
+bool autoRangeInitialized = false;
+float smoothRangeMin = 0.0f;
+float smoothRangeMax = 0.0f;
+
 void checkButtons() {
   // Interpolation button (GPIO0)
   int interpReading = digitalRead(BUTTON_INTERP);
@@ -143,6 +149,7 @@ void checkButtons() {
   if (rangeReading == LOW && lastRangeState == HIGH && millis() - lastRangeToggle > 250) {
     useManualRange = !useManualRange;
     lastRangeToggle = millis();
+    autoRangeInitialized = false;
   }
   lastRangeState = rangeReading;
 }
@@ -212,6 +219,28 @@ void computeDisplayRange(const float *data, int count, float *outMin, float *out
 
   *outMin = minVal - AUTO_RANGE_PAD;
   *outMax = maxVal + AUTO_RANGE_PAD;
+}
+
+void applyRangeSmoothing(float targetMin, float targetMax, float *outMin, float *outMax) {
+  if (!autoRangeInitialized) {
+    smoothRangeMin = targetMin;
+    smoothRangeMax = targetMax;
+    autoRangeInitialized = true;
+  } else {
+    float expandMinRate = (targetMin < smoothRangeMin) ? RANGE_EXPAND_RATE : RANGE_CONTRACT_RATE;
+    float expandMaxRate = (targetMax > smoothRangeMax) ? RANGE_EXPAND_RATE : RANGE_CONTRACT_RATE;
+    smoothRangeMin += (targetMin - smoothRangeMin) * expandMinRate;
+    smoothRangeMax += (targetMax - smoothRangeMax) * expandMaxRate;
+
+    if (smoothRangeMax - smoothRangeMin < MIN_AUTO_RANGE) {
+      float mid = 0.5f * (smoothRangeMin + smoothRangeMax);
+      smoothRangeMin = mid - MIN_AUTO_RANGE * 0.5f;
+      smoothRangeMax = mid + MIN_AUTO_RANGE * 0.5f;
+    }
+  }
+
+  *outMin = smoothRangeMin;
+  *outMax = smoothRangeMax;
 }
 
 // ------------- Drawing -------------
@@ -316,6 +345,10 @@ void loop() {
     for (int i = 0; i < AMG88xx_PIXEL_ARRAY_SIZE; i++) {
       displayPixels[i] = suppressAmbientNoise(pixels[i], medianTemp);
     }
+    float targetMin, targetMax;
+    framePixels = displayPixels;
+    computeDisplayRange(displayPixels, AMG88xx_PIXEL_ARRAY_SIZE, &targetMin, &targetMax);
+    applyRangeSmoothing(targetMin, targetMax, &tMin, &tMax);
     framePixels = displayPixels;
     computeDisplayRange(displayPixels, AMG88xx_PIXEL_ARRAY_SIZE, &tMin, &tMax);
   }
@@ -349,5 +382,6 @@ void loop() {
 
   // Restore original rotation
   tft.setRotation(prevRot);
+  delay(45);
   delay(60);
 }
