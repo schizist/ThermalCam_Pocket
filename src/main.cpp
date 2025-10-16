@@ -6,6 +6,7 @@ TFT_eSPI tft = TFT_eSPI();
 Adafruit_AMG88xx amg;
 
 float pixels[AMG88xx_PIXEL_ARRAY_SIZE];
+float displayPixels[AMG88xx_PIXEL_ARRAY_SIZE];
 
 const int GRID_W = 8;
 const int GRID_H = 8;
@@ -68,6 +69,12 @@ bool useManualRange = false;
 float manualMin = 20.0f;
 float manualMax = 40.0f;
 
+const float AMBIENT_DEADBAND = 0.8f;
+const float AUTO_RANGE_PAD = 0.4f;
+const float MIN_AUTO_RANGE = 1.0f;
+const float RANGE_EXPAND_RATE = 0.55f;
+const float RANGE_CONTRACT_RATE = 0.18f;
+
 // ------------- Power Off -------------
 void powerOff() {
   tft.writecommand(ST7789_DISPOFF);
@@ -116,6 +123,10 @@ unsigned long interpPressStart = 0;
 bool lastRangeState = HIGH;
 unsigned long lastRangeToggle = 0;
 
+bool autoRangeInitialized = false;
+float smoothRangeMin = 0.0f;
+float smoothRangeMax = 0.0f;
+
 void checkButtons() {
   // Interpolation button (GPIO0)
   int interpReading = digitalRead(BUTTON_INTERP);
@@ -138,6 +149,7 @@ void checkButtons() {
   if (rangeReading == LOW && lastRangeState == HIGH && millis() - lastRangeToggle > 250) {
     useManualRange = !useManualRange;
     lastRangeToggle = millis();
+    autoRangeInitialized = false;
   }
   lastRangeState = rangeReading;
 }
@@ -174,6 +186,63 @@ void drawTempStats(float tMin, float tMax, float median) {
   tft.drawString(buf, textX, textY + 30, 2);
 }
 
+float suppressAmbientNoise(float value, float ambient) {
+  float diff = value - ambient;
+  if (diff > AMBIENT_DEADBAND) {
+    return ambient + (diff - AMBIENT_DEADBAND);
+  }
+  if (diff < -AMBIENT_DEADBAND) {
+    return ambient + (diff + AMBIENT_DEADBAND);
+  }
+  return ambient;
+}
+
+void computeDisplayRange(const float *data, int count, float *outMin, float *outMax) {
+  if (count <= 0) {
+    *outMin = 0.0f;
+    *outMax = 1.0f;
+    return;
+  }
+
+  float minVal = data[0];
+  float maxVal = data[0];
+  for (int i = 1; i < count; i++) {
+    if (data[i] < minVal) minVal = data[i];
+    if (data[i] > maxVal) maxVal = data[i];
+  }
+
+  if (maxVal - minVal < MIN_AUTO_RANGE) {
+    float mid = 0.5f * (maxVal + minVal);
+    minVal = mid - MIN_AUTO_RANGE * 0.5f;
+    maxVal = mid + MIN_AUTO_RANGE * 0.5f;
+  }
+
+  *outMin = minVal - AUTO_RANGE_PAD;
+  *outMax = maxVal + AUTO_RANGE_PAD;
+}
+
+void applyRangeSmoothing(float targetMin, float targetMax, float *outMin, float *outMax) {
+  if (!autoRangeInitialized) {
+    smoothRangeMin = targetMin;
+    smoothRangeMax = targetMax;
+    autoRangeInitialized = true;
+  } else {
+    float expandMinRate = (targetMin < smoothRangeMin) ? RANGE_EXPAND_RATE : RANGE_CONTRACT_RATE;
+    float expandMaxRate = (targetMax > smoothRangeMax) ? RANGE_EXPAND_RATE : RANGE_CONTRACT_RATE;
+    smoothRangeMin += (targetMin - smoothRangeMin) * expandMinRate;
+    smoothRangeMax += (targetMax - smoothRangeMax) * expandMaxRate;
+
+    if (smoothRangeMax - smoothRangeMin < MIN_AUTO_RANGE) {
+      float mid = 0.5f * (smoothRangeMin + smoothRangeMax);
+      smoothRangeMin = mid - MIN_AUTO_RANGE * 0.5f;
+      smoothRangeMax = mid + MIN_AUTO_RANGE * 0.5f;
+    }
+  }
+
+  *outMin = smoothRangeMin;
+  *outMax = smoothRangeMax;
+}
+
 // ------------- Drawing -------------
 void drawInterpolatedHeatmap(const float *pix, float tMin, float tMax) {
   int W = tft.width();
@@ -196,7 +265,7 @@ void drawInterpolatedHeatmap(const float *pix, float tMin, float tMax) {
   tft.endWrite();
 }
 
-void drawHeatmap(float *pixels, float tMin, float tMax) {
+void drawHeatmap(const float *pixels, float tMin, float tMax) {
   int cellW = ceilf((float)SCREEN_W / GRID_W);
   int cellH = ceilf((float)SCREEN_H / GRID_H);
   for (int y = 0; y < GRID_H; y++) {
@@ -265,52 +334,51 @@ void setup() {
 void loop() {
   amg.readPixels(pixels);
 
+  float medianTemp = computeMedian(pixels, AMG88xx_PIXEL_ARRAY_SIZE);
+
+  const float *framePixels = pixels;
   float tMin, tMax;
   if (useManualRange) {
     tMin = manualMin;
     tMax = manualMax;
   } else {
-    tMin = 1000.0f;
-    tMax = -1000.0f;
     for (int i = 0; i < AMG88xx_PIXEL_ARRAY_SIZE; i++) {
-      if (pixels[i] < tMin) tMin = pixels[i];
-      if (pixels[i] > tMax) tMax = pixels[i];
+      displayPixels[i] = suppressAmbientNoise(pixels[i], medianTemp);
     }
-    if (tMax - tMin < 1.0f) tMax = tMin + 1.0f;
-    const float pad = 1.5f;
-    tMin -= pad; tMax += pad;
+    float targetMin, targetMax;
+    framePixels = displayPixels;
+    computeDisplayRange(displayPixels, AMG88xx_PIXEL_ARRAY_SIZE, &targetMin, &targetMax);
+    applyRangeSmoothing(targetMin, targetMax, &tMin, &tMax);
   }
 
   checkButtons();
 
-  float medianTemp = computeMedian(pixels, AMG88xx_PIXEL_ARRAY_SIZE);
-
   if (useInterpolation) {
-    bilinearInterpolate(pixels, interpBuf, GRID_W, GRID_H, UPSCALE);
+    bilinearInterpolate(framePixels, interpBuf, GRID_W, GRID_H, UPSCALE);
     drawInterpolatedHeatmap(interpBuf, tMin, tMax);
   } else {
-    drawHeatmap(pixels, tMin, tMax);
+    drawHeatmap(framePixels, tMin, tMax);
   }
 
-// Save current rotation
-uint8_t prevRot = tft.getRotation();
+  // Save current rotation
+  uint8_t prevRot = tft.getRotation();
 
-// Set rotation to match the image rotation for overlay drawing
-tft.setRotation(1);
+  // Set rotation to match the image rotation for overlay drawing
+  tft.setRotation(1);
 
-drawTempStats(tMin, tMax, medianTemp);
+  drawTempStats(tMin, tMax, medianTemp);
 
-// Draw battery indicator (always top-right in current orientation)
+  // Draw battery indicator (always top-right in current orientation)
   float battV = readBatteryVoltage();
   int battW = 32, battH = 14;
 
-// Use TFT_eSPI's width/height for current rotation
+  // Use TFT_eSPI's width/height for current rotation
   int battX = tft.width() - battW - 6;  // 6px margin from right
   int battY = 6;                        // 6px margin from top
 
-drawBatteryIndicator(battX, battY, battW, battH, battV);
+  drawBatteryIndicator(battX, battY, battW, battH, battV);
 
-// Restore original rotation
-tft.setRotation(prevRot);
-  delay(60);
+  // Restore original rotation
+  tft.setRotation(prevRot);
+  delay(45);
 }
