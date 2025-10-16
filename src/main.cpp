@@ -1,6 +1,8 @@
 #include <Wire.h>
 #include <Adafruit_AMG88xx.h>
 #include <TFT_eSPI.h>
+#include <cmath>
+#include <cstring>
 
 TFT_eSPI tft = TFT_eSPI();  
 Adafruit_AMG88xx amg;
@@ -28,31 +30,56 @@ float readBatteryVoltage() {
 }
 
 void drawBatteryIndicator(int x, int y, int w, int h, float voltage) {
-  // Clear the area to reduce flicker
-  int clearW = w + 44; // battery + text
-  int clearH = h;
-  tft.fillRect(x - 44, y, clearW, clearH, TFT_BLACK);
+  static int prevX = -1;
+  static int prevY = -1;
+  static int prevW = -1;
+  static int prevH = -1;
+  static int prevPercent = -1;
+  static int prevFillW = -1;
+  static uint16_t prevFillColor = 0;
 
   float pct = (voltage - BATTERY_MIN_V) / (BATTERY_MAX_V - BATTERY_MIN_V);
   if (pct < 0) pct = 0;
   if (pct > 1) pct = 1;
-  int fillW = (int)((w - 4) * pct);
-  // Draw battery outline
-  tft.drawRect(x, y, w, h, TFT_WHITE);
-  tft.fillRect(x + w, y + h/4, 3, h/2, TFT_WHITE); // battery tip
-  // Fill level
+  int fillW = (int)((w - 4) * pct + 0.5f);
+
   uint16_t fillColor = (pct > 0.2f) ? TFT_GREEN : TFT_RED;
-  tft.fillRect(x + 2, y + 2, fillW, h - 4, fillColor);
-  // Percentage text (to the left of the battery, right-aligned)
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  char buf[8];
   int percent = (int)(pct * 100.0f + 0.5f);
   if (percent > 100) percent = 100;
   if (percent < 0) percent = 0;
-  snprintf(buf, sizeof(buf), "%d%%", percent);
-  int textX = x - 2 - tft.textWidth(buf, 2);
-  int textY = y + (h - 16) / 2;
-  tft.drawString(buf, textX, textY, 2);
+
+  bool geometryChanged = (prevX != x) || (prevY != y) || (prevW != w) || (prevH != h);
+  bool fillChanged = (prevFillW != fillW) || (prevFillColor != fillColor);
+  bool percentChanged = (prevPercent != percent);
+
+  if (geometryChanged || fillChanged || percentChanged) {
+    int clearW = w + 44; // battery + text
+    int clearH = h;
+    tft.fillRect(x - 44, y, clearW, clearH, TFT_BLACK);
+
+    // Draw battery outline
+    tft.drawRect(x, y, w, h, TFT_WHITE);
+    tft.fillRect(x + w, y + h/4, 3, h/2, TFT_WHITE); // battery tip
+
+    // Fill level
+    tft.fillRect(x + 2, y + 2, fillW, h - 4, fillColor);
+
+    // Percentage text (to the left of the battery, right-aligned)
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%d%%", percent);
+    int textX = x - 2 - tft.textWidth(buf, 2);
+    int textY = y + (h - 16) / 2;
+    tft.drawString(buf, textX, textY, 2);
+
+    prevX = x;
+    prevY = y;
+    prevW = w;
+    prevH = h;
+    prevPercent = percent;
+    prevFillW = fillW;
+    prevFillColor = fillColor;
+  }
 }
 
 #define UPSCALE 8
@@ -66,8 +93,16 @@ float interpBuf[INTERP_W * INTERP_H];
 
 bool useInterpolation = true;
 bool useManualRange = false;
-float manualMin = 20.0f;
-float manualMax = 40.0f;
+float manualMin = 15.0f;
+float manualMax = 32.0f;
+
+const float AMBIENT_DEADBAND = 0.8f;
+const float AUTO_TRIM_LOW = 0.08f;
+const float AUTO_TRIM_HIGH = 0.92f;
+const float AUTO_RANGE_PAD = 0.35f;
+const float MIN_AUTO_RANGE = 0.8f;
+const float RANGE_EXPAND_RATE = 0.58f;
+const float RANGE_CONTRACT_RATE = 0.16f;
 
 const float AMBIENT_DEADBAND = 0.8f;
 const float AUTO_RANGE_PAD = 0.4f;
@@ -169,6 +204,9 @@ float computeMedian(float *arr, int n) {
 }
 
 void drawTempStats(float tMin, float tMax, float median) {
+  static char prevMin[32] = "";
+  static char prevMax[32] = "";
+  static char prevMed[32] = "";
   char buf[32];
 
   // Position in bottom-left corner relative to current rotation
@@ -177,13 +215,90 @@ void drawTempStats(float tMin, float tMax, float median) {
   int textX = 5;
 
   snprintf(buf, sizeof(buf), "Min: %.1f", tMin);
-  tft.drawString(buf, textX, textY, 2);
+  if (strcmp(buf, prevMin) != 0) {
+    tft.drawString(buf, textX, textY, 2);
+    strcpy(prevMin, buf);
+  }
 
   snprintf(buf, sizeof(buf), "Max: %.1f", tMax);
-  tft.drawString(buf, textX, textY + 15, 2);
+  if (strcmp(buf, prevMax) != 0) {
+    tft.drawString(buf, textX, textY + 15, 2);
+    strcpy(prevMax, buf);
+  }
 
   snprintf(buf, sizeof(buf), "Med: %.1f", median);
-  tft.drawString(buf, textX, textY + 30, 2);
+  if (strcmp(buf, prevMed) != 0) {
+    tft.drawString(buf, textX, textY + 30, 2);
+    strcpy(prevMed, buf);
+  }
+}
+
+float suppressAmbientNoise(float value, float ambient) {
+  float diff = value - ambient;
+  if (diff > AMBIENT_DEADBAND) {
+    return ambient + (diff - AMBIENT_DEADBAND);
+  }
+  if (diff < -AMBIENT_DEADBAND) {
+    return ambient + (diff + AMBIENT_DEADBAND);
+  }
+  return ambient;
+}
+
+void computeDisplayRange(const float *data, int count, float *outMin, float *outMax) {
+  if (count <= 0) {
+    *outMin = 0.0f;
+    *outMax = 1.0f;
+    return;
+  }
+
+  float sorted[AMG88xx_PIXEL_ARRAY_SIZE];
+  memcpy(sorted, data, count * sizeof(float));
+  std::sort(sorted, sorted + count);
+
+  int lowIndex = (int)floorf((count - 1) * AUTO_TRIM_LOW + 0.5f);
+  int highIndex = (int)floorf((count - 1) * AUTO_TRIM_HIGH + 0.5f);
+  lowIndex = constrain(lowIndex, 0, count - 1);
+  highIndex = constrain(highIndex, 0, count - 1);
+  if (highIndex < lowIndex) {
+    highIndex = lowIndex;
+  }
+
+  float minVal = sorted[lowIndex];
+  float maxVal = sorted[highIndex];
+
+  if (maxVal - minVal < MIN_AUTO_RANGE) {
+    float mid = 0.5f * (maxVal + minVal);
+    minVal = mid - MIN_AUTO_RANGE * 0.5f;
+    maxVal = mid + MIN_AUTO_RANGE * 0.5f;
+  }
+
+  float range = maxVal - minVal;
+  float pad = max(AUTO_RANGE_PAD, range * 0.12f);
+
+  *outMin = minVal - pad;
+  *outMax = maxVal + pad;
+}
+
+void applyRangeSmoothing(float targetMin, float targetMax, float *outMin, float *outMax) {
+  if (!autoRangeInitialized) {
+    smoothRangeMin = targetMin;
+    smoothRangeMax = targetMax;
+    autoRangeInitialized = true;
+  } else {
+    float expandMinRate = (targetMin < smoothRangeMin) ? RANGE_EXPAND_RATE : RANGE_CONTRACT_RATE;
+    float expandMaxRate = (targetMax > smoothRangeMax) ? RANGE_EXPAND_RATE : RANGE_CONTRACT_RATE;
+    smoothRangeMin += (targetMin - smoothRangeMin) * expandMinRate;
+    smoothRangeMax += (targetMax - smoothRangeMax) * expandMaxRate;
+
+    if (smoothRangeMax - smoothRangeMin < MIN_AUTO_RANGE) {
+      float mid = 0.5f * (smoothRangeMin + smoothRangeMax);
+      smoothRangeMin = mid - MIN_AUTO_RANGE * 0.5f;
+      smoothRangeMax = mid + MIN_AUTO_RANGE * 0.5f;
+    }
+  }
+
+  *outMin = smoothRangeMin;
+  *outMax = smoothRangeMax;
 }
 
 float suppressAmbientNoise(float value, float ambient) {
