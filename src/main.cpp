@@ -7,11 +7,11 @@
 #include <TFT_eSPI.h>
 
 #ifndef WIFI_SSID
-#define WIFI_SSID "YOUR_WIFI_SSID"
+#define WIFI_SSID "Advanced Alien Technology Mk II"
 #endif
 
 #ifndef WIFI_PASSWORD
-#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+#define WIFI_PASSWORD "uireo-89pqk-qsknl"
 #endif
 
 WebServer server(80);
@@ -19,6 +19,9 @@ WebServer server(80);
 TFT_eSPI tft = TFT_eSPI();  
 Adafruit_AMG88xx amg;
 
+bool autoRangeInitialized = false;
+float smoothRangeMin = 0.0f;
+float smoothRangeMax = 0.0f;
 float pixels[AMG88xx_PIXEL_ARRAY_SIZE];
 float displayPixels[AMG88xx_PIXEL_ARRAY_SIZE];
 
