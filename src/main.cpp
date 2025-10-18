@@ -84,15 +84,15 @@ float interpBuf[INTERP_W * INTERP_H];
 
 bool useInterpolation = true;
 bool useManualRange = false;
-float manualMin = 20.0f;
-float manualMax = 40.0f;
+float manualMin = 8.50f;
+float manualMax = 30.50f;
 
 // Runtime-tunable auto-range parameters
-static const float DEFAULT_AMBIENT_DEADBAND = 0.5f;
-static const float DEFAULT_AUTO_RANGE_PAD   = 0.1f;
-static const float DEFAULT_MIN_AUTO_RANGE   = 1.0f;
+static const float DEFAULT_AMBIENT_DEADBAND = 0.1f;
+static const float DEFAULT_AUTO_RANGE_PAD   = 0.01f;
+static const float DEFAULT_MIN_AUTO_RANGE   = 10.0f;
 static const float DEFAULT_RANGE_EXPAND_RATE   = 0.55f;
-static const float DEFAULT_RANGE_CONTRACT_RATE = 0.18f;
+static const float DEFAULT_RANGE_CONTRACT_RATE = 0.50f;
 
 float ambientDeadband = DEFAULT_AMBIENT_DEADBAND;
 float autoRangePad = DEFAULT_AUTO_RANGE_PAD;
@@ -651,6 +651,4 @@ void loop() {
   // Small pacing and allow web server to run
   delay(60);
   for (int i = 0; i < 6; i++) { server.handleClient(); delay(15); }
-}
-
 }
