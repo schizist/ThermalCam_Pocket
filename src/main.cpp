@@ -540,70 +540,57 @@ void setup() {
   tft.drawString("Thermal Imager Init OK", 10, 10, 2);
   tft.drawString("Starting Access Point...", 10, 30, 2);
 
-  // Start as WiFi access point so clients can connect directly to the ESP
-  WiFi.mode(WIFI_AP);
-  // Build a short, simple SSID based on device MAC for uniqueness
-  String baseSsid = "ThermalCam-";
-  String initMac = WiFi.macAddress();
-  String initSuffix;
-  int initLen = initMac.length();
-  if (initLen >= 5) initSuffix = initMac.substring(initLen - 5);
-  else initSuffix = initMac;
-  initSuffix.replace(":", "");
-  String apSsid = baseSsid + initSuffix;
-  // Explicitly set AP IP and subnet (common default)
-  IPAddress apLocal(192,168,4,1);
-  IPAddress apGateway(192,168,4,1);
-  IPAddress apSubnet(255,255,255,0);
-  WiFi.softAPConfig(apLocal, apGateway, apSubnet);
-  bool apStarted = false;
-  // Start AP on channel 1, not hidden
-  #ifdef WIFI_PASSWORD
-    if (strlen(WIFI_PASSWORD) > 0) apStarted = WiFi.softAP(apSsid.c_str(), WIFI_PASSWORD, 1, 0, 4);
-    else apStarted = WiFi.softAP(apSsid.c_str(), NULL, 1, 0, 4);
-  #else
-    apStarted = WiFi.softAP(apSsid.c_str(), NULL, 1, 0, 4);
-  #endif
+  // Try to connect to local Wi-Fi first
+  WiFi.mode(WIFI_STA);
+  WiFi.begin("Advanced Alien Technology Mk II", "uireo-89pqk-qsknl");
 
-  if (apStarted) {
-    IPAddress apIP = WiFi.softAPIP(); deviceIp = apIP.toString();
-    Serial.print("AP started, SSID: "); Serial.print(apSsid); Serial.print(" IP: "); Serial.println(deviceIp);
-    // indicate whether AP is secured (password set) or open
-    bool apSecured = false;
-    #ifdef WIFI_PASSWORD
-      if (strlen(WIFI_PASSWORD) > 0) apSecured = true;
-    #endif
-    Serial.print("AP mode: "); Serial.println(apSecured ? "WPA2-PSK" : "OPEN");
-    tft.fillRect(0, 30, SCREEN_W, 40, TFT_BLACK);
-    tft.drawString("AP started", 10, 30, 2);
-    String ipText = String("AP: ") + deviceIp; tft.drawString(ipText.c_str(), 10, 50, 2);
-    tft.drawString(apSecured ? "Secured" : "Open", 10, 70, 2);
-    // Start mDNS responder so clients can access via hostname.local
-    String mac = WiFi.softAPmacAddress();
-  // create short suffix from MAC (last 5 chars) and remove colons
-  String macSuffix;
-  int len = mac.length();
-  if (len >= 5) macSuffix = mac.substring(len - 5);
-  else macSuffix = mac;
-  macSuffix.replace(":", "");
-  // sanitize SSID for hostname: keep alnum and replace others with '-'
-  String host = apSsid;
-  for (size_t i = 0; i < host.length(); i++) { char c = host.charAt(i); if (!isalnum(c)) host.setCharAt(i, '-'); }
-  String mdnsName = host + "-" + macSuffix;
-  // force lowercase
-  for (size_t i = 0; i < mdnsName.length(); i++) mdnsName.setCharAt(i, tolower(mdnsName.charAt(i)));
+  unsigned long startAttempt = millis();
+  const unsigned long timeout = 10000;  // 10 seconds
+  bool wifiConnected = false;
+
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE);
+  tft.drawString("Connecting to Wi-Fi...", 10, 10, 2);
+
+  while (millis() - startAttempt < timeout) {
+    if (WiFi.status() == WL_CONNECTED) { wifiConnected = true; break; }
+    delay(500);
+    tft.fillRect(10, 30, 200, 16, TFT_BLACK);
+    tft.drawString(String(".").c_str(), 10, 30, 2);
+  }
+
+  if (wifiConnected) {
+    deviceIp = WiFi.localIP().toString();
+    tft.fillScreen(TFT_BLACK);
+    tft.drawString("Wi-Fi connected", 10, 10, 2);
+    tft.drawString(deviceIp, 10, 30, 2);
     if (MDNS.begin("thermalcam")) {
-    Serial.println("mDNS responder started: http://thermalcam.local/");
-    
+      Serial.println("mDNS responder started: http://thermalcam.local/");
+      tft.drawString("mDNS active", 10, 50, 2);
     } else {
       Serial.println("mDNS failed to start");
+      tft.drawString("mDNS failed", 10, 50, 2);
     }
   } else {
-    deviceIp = "not started";
-    Serial.println("Failed to start AP");
-    tft.fillRect(0, 30, SCREEN_W, 40, TFT_BLACK);
-    tft.drawString("AP failed", 10, 30, 2);
+    // Fallback to Access Point mode
+    Serial.println("Wi-Fi connect failed, starting AP mode...");
+    tft.fillScreen(TFT_BLACK);
+    tft.drawString("Wi-Fi failed", 10, 10, 2);
+    tft.drawString("Starting AP...", 10, 30, 2);
+
+    WiFi.mode(WIFI_AP);
+    String apSsid = "ThermalCam-" + WiFi.macAddress().substring(12);
+    IPAddress apIP(192, 168, 4, 1);
+    WiFi.softAPConfig(apIP, apIP, IPAddress(255,255,255,0));
+    WiFi.softAP(apSsid.c_str(), "thermal123");
+    deviceIp = WiFi.softAPIP().toString();
+
+    tft.fillScreen(TFT_BLACK);
+    tft.drawString("AP Mode", 10, 10, 2);
+    tft.drawString(apSsid, 10, 30, 2);
+    tft.drawString(deviceIp, 10, 50, 2);
   }
+
 
   server.on("/", handleIndex);
   server.on("/frame", HTTP_GET, handleFrame);
