@@ -162,14 +162,6 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
       <label for="sliderMax">Manual maximum: <strong><span id="sliderMaxValue">--</span> C</strong>
         <input type="range" id="sliderMax" min="-20" max="120" step="0.1">
       </label>
-      <h2 class="group-title">Auto range tuning</h2>
-      <div class="setting-grid">
-        <label>Ambient deadband (C) <input type="number" id="inputAmbient" min="0" max="5" step="0.05"></label>
-        <label>Auto range pad (C)    <input type="number" id="inputRangePad" min="0" max="5" step="0.05"></label>
-        <label>Min auto range (C)    <input type="number" id="inputMinRange" min="0.1" max="10" step="0.1"></label>
-        <label>Expand rate (0-1)     <input type="number" id="inputExpandRate" min="0" max="1" step="0.01"></label>
-        <label>Contract rate (0-1)   <input type="number" id="inputContractRate" min="0" max="1" step="0.01"></label>
-      </div>
       <div class="status">IP address: <span id="ip-address">--</span></div>
       <div class="status">Last frame: <span id="last-frame">--</span></div>
     </div>
