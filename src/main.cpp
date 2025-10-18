@@ -162,6 +162,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
       <label for="sliderMax">Manual maximum: <strong><span id="sliderMaxValue">--</span> C</strong>
         <input type="range" id="sliderMax" min="-20" max="120" step="0.1">
       </label>
+      <!-- Auto range tuning removed from UI -->
       <div class="status">IP address: <span id="ip-address">--</span></div>
       <div class="status">Last frame: <span id="last-frame">--</span></div>
     </div>
@@ -180,11 +181,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
     const toggleInterp = document.getElementById('toggleInterp');
     const ipAddress = document.getElementById('ip-address');
     const lastFrame = document.getElementById('last-frame');
-    const inputAmbient = document.getElementById('inputAmbient');
-    const inputRangePad = document.getElementById('inputRangePad');
-    const inputMinRange = document.getElementById('inputMinRange');
-    const inputExpandRate = document.getElementById('inputExpandRate');
-    const inputContractRate = document.getElementById('inputContractRate');
+  // Auto-range tuning controls removed from UI; keep defaults in firmware
 
     const GRID_SIZE = 8;
     const UPSCALE = 8;
@@ -279,11 +276,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
       sliderMin.disabled = sliderMax.disabled = !data.useManualRange;
       toggleManual.checked = data.useManualRange;
       toggleInterp.checked = data.useInterpolation;
-      if (document.activeElement !== inputAmbient) inputAmbient.value = data.ambientDeadband.toFixed(2);
-      if (document.activeElement !== inputRangePad) inputRangePad.value = data.autoRangePad.toFixed(2);
-      if (document.activeElement !== inputMinRange) inputMinRange.value = data.minAutoRange.toFixed(2);
-      if (document.activeElement !== inputExpandRate) inputExpandRate.value = data.rangeExpandRate.toFixed(2);
-      if (document.activeElement !== inputContractRate) inputContractRate.value = data.rangeContractRate.toFixed(2);
+  // Auto-range tuning values are not exposed in the web UI.
     }
 
     function fetchFrame() {
@@ -302,11 +295,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
 
     toggleManual.addEventListener('change', () => { queueSettingUpdate('useManualRange', toggleManual.checked); sliderMin.disabled = sliderMax.disabled = !toggleManual.checked; });
     toggleInterp.addEventListener('change', () => { queueSettingUpdate('useInterpolation', toggleInterp.checked); });
-    bindNumberInput(inputAmbient, 'ambientDeadband', { min:0, max:5, decimals:2 });
-    bindNumberInput(inputRangePad, 'autoRangePad', { min:0, max:5, decimals:2 });
-    bindNumberInput(inputMinRange, 'minAutoRange', { min:0.1, max:20, decimals:2 });
-    bindNumberInput(inputExpandRate, 'rangeExpandRate', { min:0, max:1, decimals:2 });
-    bindNumberInput(inputContractRate, 'rangeContractRate', { min:0, max:1, decimals:2 });
+  // Auto-range tuning bindings removed.
     sliderMin.addEventListener('input', () => { const v=Number(sliderMin.value); sliderMinValue.textContent = v.toFixed(1); queueSettingUpdate('manualMin', v); });
     sliderMax.addEventListener('input', () => { const v=Number(sliderMax.value); sliderMaxValue.textContent = v.toFixed(1); queueSettingUpdate('manualMax', v); });
 
@@ -335,11 +324,6 @@ static void handleFrame() {
   doc["useManualRange"] = useManualRange;
   doc["manualMin"] = manualMin;
   doc["manualMax"] = manualMax;
-  doc["ambientDeadband"] = ambientDeadband;
-  doc["autoRangePad"] = autoRangePad;
-  doc["minAutoRange"] = minAutoRange;
-  doc["rangeExpandRate"] = rangeExpandRate;
-  doc["rangeContractRate"] = rangeContractRate;
   if (frameAvailable) {
     doc["timestamp"] = latestFrameMillis;
     doc["tMin"] = latestFrameMin;
@@ -364,11 +348,6 @@ static void handleSettingsGet() {
   doc["useManualRange"] = useManualRange;
   doc["useInterpolation"] = useInterpolation;
   doc["ip"] = deviceIp;
-  doc["ambientDeadband"] = ambientDeadband;
-  doc["autoRangePad"] = autoRangePad;
-  doc["minAutoRange"] = minAutoRange;
-  doc["rangeExpandRate"] = rangeExpandRate;
-  doc["rangeContractRate"] = rangeContractRate;
   sendJson(doc);
 }
 
@@ -388,11 +367,6 @@ static void handleSettingsPost() {
   }
   if (doc.containsKey("useInterpolation")) useInterpolation = doc["useInterpolation"].as<bool>();
 
-  if (doc.containsKey("ambientDeadband")) { float v = doc["ambientDeadband"].as<float>(); if (v < 0) v = 0; if (fabsf(v - ambientDeadband) > 0.0001f) { ambientDeadband = v; tuningChanged = true; } }
-  if (doc.containsKey("autoRangePad")) { float v = doc["autoRangePad"].as<float>(); if (v < 0) v = 0; if (fabsf(v - autoRangePad) > 0.0001f) { autoRangePad = v; tuningChanged = true; } }
-  if (doc.containsKey("minAutoRange")) { float v = doc["minAutoRange"].as<float>(); if (v < 0.1f) v = 0.1f; if (fabsf(v - minAutoRange) > 0.0001f) { minAutoRange = v; tuningChanged = true; } }
-  if (doc.containsKey("rangeExpandRate")) { float v = doc["rangeExpandRate"].as<float>(); v = constrain(v, 0.0f, 1.0f); if (fabsf(v - rangeExpandRate) > 0.0001f) { rangeExpandRate = v; tuningChanged = true; } }
-  if (doc.containsKey("rangeContractRate")) { float v = doc["rangeContractRate"].as<float>(); v = constrain(v, 0.0f, 1.0f); if (fabsf(v - rangeContractRate) > 0.0001f) { rangeContractRate = v; tuningChanged = true; } }
 
   if (tuningChanged) autoRangeInitialized = false;
   handleSettingsGet();
