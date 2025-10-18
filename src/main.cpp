@@ -11,10 +11,7 @@
 #include <TFT_eSPI.h>
 #include <algorithm>
 #include <cmath>
-
-#ifndef WIFI_SSID
-#define WIFI_SSID "Advanced Alien Technology Mk II"
-#endif
+#include <ArduinoOTA.h>
 
 #ifndef WIFI_PASSWORD
 #define WIFI_PASSWORD "thermal123"
@@ -595,8 +592,9 @@ void setup() {
   String mdnsName = host + "-" + macSuffix;
   // force lowercase
   for (size_t i = 0; i < mdnsName.length(); i++) mdnsName.setCharAt(i, tolower(mdnsName.charAt(i)));
-    if (MDNS.begin(mdnsName.c_str())) {
-      Serial.print("mDNS responder started: http://"); Serial.print(mdnsName); Serial.println(".local/");
+    if (MDNS.begin("thermalcam")) {
+    Serial.println("mDNS responder started: http://thermalcam.local/");
+    
     } else {
       Serial.println("mDNS failed to start");
     }
