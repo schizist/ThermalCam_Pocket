@@ -25,6 +25,8 @@ static const int GRID_W = 8;
 static const int GRID_H = 8;
 float pixels[AMG88xx_PIXEL_ARRAY_SIZE];
 float displayPixels[AMG88xx_PIXEL_ARRAY_SIZE];
+bool useGrayscale = false;
+
 
 // Screen size (T-Display)
 #define SCREEN_W 240
@@ -364,7 +366,6 @@ static void handleSettingsPost() {
   }
   if (doc.containsKey("useInterpolation")) useInterpolation = doc["useInterpolation"].as<bool>();
 
-
   if (tuningChanged) autoRangeInitialized = false;
   handleSettingsGet();
 }
@@ -396,7 +397,15 @@ static uint16_t thermalGradient(float ratio) {
   return tft.color565(r,g,b);
 }
 static uint16_t tempToColor(float temp, float tMin, float tMax) {
-  float ratio = (temp - tMin) / (tMax - tMin); ratio = gammaAdjust(ratio, 0.6f); return thermalGradient(ratio);
+  float ratio = (temp - tMin) / (tMax - tMin);
+  ratio = gammaAdjust(ratio, 0.6f);
+
+  if (useGrayscale) {
+    uint8_t v = (uint8_t)(255 * ratio);
+    return tft.color565(v, v, v);
+  } else {
+    return thermalGradient(ratio);
+  }
 }
 
 // Buttons
@@ -405,17 +414,36 @@ bool lastRangeState = HIGH;  unsigned long lastRangeToggle = 0;
 
 static void checkButtons() {
   int interpReading = digitalRead(BUTTON_INTERP);
+  int rangeReading  = digitalRead(BUTTON_RANGE);
+
+  // --- Interpolation button: short press toggles grayscale, long press toggles interpolation ---
+  static unsigned long interpPressStart = 0;
   if (interpReading == LOW && lastInterpState == HIGH) interpPressStart = millis();
   if (interpReading == HIGH && lastInterpState == LOW) {
     unsigned long pressDuration = millis() - interpPressStart;
-    if (pressDuration < 2000) useInterpolation = !useInterpolation;
+    if (pressDuration < 800) useGrayscale = !useGrayscale;  // short press = toggle grayscale
+    else useInterpolation = !useInterpolation;              // long press = toggle interpolation
   }
-  if (interpReading == LOW && millis() - interpPressStart > 2000) powerOff();
   lastInterpState = interpReading;
 
-  int rangeReading = digitalRead(BUTTON_RANGE);
-  if (rangeReading == LOW && lastRangeState == HIGH && millis() - lastRangeToggle > 250) {
-    useManualRange = !useManualRange; lastRangeToggle = millis(); autoRangeInitialized = false;
+
+  // --- Range button: long press to power off, short press toggles range ---
+  static unsigned long rangePressStart = 0;
+  if (rangeReading == LOW && lastRangeState == HIGH) rangePressStart = millis();
+  if (rangeReading == HIGH && lastRangeState == LOW) {
+    unsigned long pressDuration = millis() - rangePressStart;
+    if (pressDuration < 2000) {
+      // short press toggles manual range
+      if (millis() - lastRangeToggle > 250) {
+        useManualRange = !useManualRange;
+        lastRangeToggle = millis();
+        autoRangeInitialized = false;
+      }
+    }
+  }
+  if (rangeReading == LOW && millis() - rangePressStart > 2000) {
+    // long press powers off
+    powerOff();
   }
   lastRangeState = rangeReading;
 }
@@ -636,7 +664,6 @@ void loop() {
   }
 
   checkButtons();
-
   // Rotate for web feed (flip to match orientation)
   for (int y = 0; y < GRID_H; y++) {
     for (int x = 0; x < GRID_W; x++) {
