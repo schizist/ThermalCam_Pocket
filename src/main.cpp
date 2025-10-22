@@ -688,3 +688,23 @@ void loop() {
   delay(60);
   for (int i = 0; i < 6; i++) { server.handleClient(); delay(15); }
 }
+// This was tested using the AI Thinker board and worked
+// #include <ESP32Servo.h>
+
+// Servo servo;
+// int servoPin = 27;  // GPIO 26 works well
+
+// void setup() {
+//   psramInit(); // optional safe call
+//   servo.attach(servoPin);
+// }
+
+// void loop() {
+//   servo.writeMicroseconds(1500); // stop
+//   delay(2000);
+//   servo.writeMicroseconds(1000); // full reverse
+//   delay(2000);
+//   servo.writeMicroseconds(2000); // full forward
+//   delay(2000);
+// }
+ 
