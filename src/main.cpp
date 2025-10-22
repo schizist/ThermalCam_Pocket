@@ -28,8 +28,12 @@ static const int GRID_W = 8;
 static const int GRID_H = 8;
 float pixels[AMG88xx_PIXEL_ARRAY_SIZE];
 float displayPixels[AMG88xx_PIXEL_ARRAY_SIZE];
+// PID control for servo
+float kp = 70.0f; //Controls oscillation
+float ki = 10.0f; //Controls steady state error
+float kd = 40.0f; //Controls overshoot
 bool useGrayscale = false;
-
+bool motorEnabled = true;
 
 // Screen size (T-Display)
 #define SCREEN_W 240
@@ -164,6 +168,16 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
       <label for="sliderMax">Manual maximum: <strong><span id="sliderMaxValue">--</span> C</strong>
         <input type="range" id="sliderMax" min="-20" max="120" step="0.1">
       </label>
+      <div class="group-title">Servo PID</div>
+      <label for="kp">Kp: <strong><span id="kpVal">--</span></strong>
+        <input type="range" id="kp" min="0" max="200" step="1">
+      </label>
+      <label for="ki">Ki: <strong><span id="kiVal">--</span></strong>
+        <input type="range" id="ki" min="0" max="50" step="1">
+      </label>
+      <label for="kd">Kd: <strong><span id="kdVal">--</span></strong>
+        <input type="range" id="kd" min="0" max="100" step="1">
+      </label>
       <!-- Auto range tuning removed from UI -->
       <div class="status">IP address: <span id="ip-address">--</span></div>
       <div class="status">Last frame: <span id="last-frame">--</span></div>
@@ -183,6 +197,35 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
     const toggleInterp = document.getElementById('toggleInterp');
     const ipAddress = document.getElementById('ip-address');
     const lastFrame = document.getElementById('last-frame');
+    const kpSlider = document.getElementById('kp');
+    const kiSlider = document.getElementById('ki');
+    const kdSlider = document.getElementById('kd');
+    const kpVal = document.getElementById('kpVal');
+    const kiVal = document.getElementById('kiVal');
+    const kdVal = document.getElementById('kdVal');
+
+    function updatePIDControls(data) {
+      kpSlider.value = data.kp;
+      kiSlider.value = data.ki;
+      kdSlider.value = data.kd;
+      kpVal.textContent = data.kp.toFixed(1);
+      kiVal.textContent = data.ki.toFixed(1);
+      kdVal.textContent = data.kd.toFixed(1);
+    }
+
+    kpSlider.addEventListener('input', () => {
+      kpVal.textContent = kpSlider.value;
+      queueSettingUpdate('kp', parseFloat(kpSlider.value));
+    });
+    kiSlider.addEventListener('input', () => {
+      kiVal.textContent = kiSlider.value;
+      queueSettingUpdate('ki', parseFloat(kiSlider.value));
+    });
+    kdSlider.addEventListener('input', () => {
+      kdVal.textContent = kdSlider.value;
+      queueSettingUpdate('kd', parseFloat(kdSlider.value));
+    });
+
   // Auto-range tuning controls removed from UI; keep defaults in firmware
 
     const GRID_SIZE = 8;
@@ -278,6 +321,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
       sliderMin.disabled = sliderMax.disabled = !data.useManualRange;
       toggleManual.checked = data.useManualRange;
       toggleInterp.checked = data.useInterpolation;
+      updatePIDControls(data);
   // Auto-range tuning values are not exposed in the web UI.
     }
 
@@ -326,6 +370,9 @@ static void handleFrame() {
   doc["useManualRange"] = useManualRange;
   doc["manualMin"] = manualMin;
   doc["manualMax"] = manualMax;
+  doc["kp"] = kp;
+  doc["ki"] = ki;
+  doc["kd"] = kd;
   if (frameAvailable) {
     doc["timestamp"] = latestFrameMillis;
     doc["tMin"] = latestFrameMin;
@@ -342,13 +389,15 @@ static void handleFrame() {
   }
   sendJson(doc);
 }
-
 static void handleSettingsGet() {
   StaticJsonDocument<256> doc;
   doc["manualMin"] = manualMin;
   doc["manualMax"] = manualMax;
   doc["useManualRange"] = useManualRange;
   doc["useInterpolation"] = useInterpolation;
+  doc["kp"] = kp;
+  doc["ki"] = ki;
+  doc["kd"] = kd;
   doc["ip"] = deviceIp;
   sendJson(doc);
 }
@@ -358,18 +407,15 @@ static void handleSettingsPost() {
   StaticJsonDocument<512> doc; DeserializationError err = deserializeJson(doc, server.arg("plain"));
   if (err) { sendJsonError(400, "Invalid JSON"); return; }
 
-  bool rangeChanged = false, tuningChanged = false;
-  if (doc.containsKey("manualMin")) { manualMin = doc["manualMin"].as<float>(); rangeChanged = true; }
-  if (doc.containsKey("manualMax")) { manualMax = doc["manualMax"].as<float>(); rangeChanged = true; }
-  if (rangeChanged && manualMax - manualMin < 0.1f) manualMax = manualMin + 0.1f;
-
-  if (doc.containsKey("useManualRange")) {
-    bool newMode = doc["useManualRange"].as<bool>();
-    if (newMode != useManualRange) { useManualRange = newMode; autoRangeInitialized = false; }
-  }
+  if (doc.containsKey("manualMin")) manualMin = doc["manualMin"].as<float>();
+  if (doc.containsKey("manualMax")) manualMax = doc["manualMax"].as<float>();
+  if (doc.containsKey("useManualRange")) useManualRange = doc["useManualRange"].as<bool>();
   if (doc.containsKey("useInterpolation")) useInterpolation = doc["useInterpolation"].as<bool>();
 
-  if (tuningChanged) autoRangeInitialized = false;
+  if (doc.containsKey("kp")) kp = doc["kp"].as<float>();
+  if (doc.containsKey("ki")) ki = doc["ki"].as<float>();
+  if (doc.containsKey("kd")) kd = doc["kd"].as<float>();
+
   handleSettingsGet();
 }
 
@@ -429,6 +475,21 @@ static void checkButtons() {
   }
   lastInterpState = interpReading;
 
+  // --- Combined press: toggle motor function ---
+  static unsigned long bothPressStart = 0;
+  if (interpReading == LOW && rangeReading == LOW) {
+    if (bothPressStart == 0) bothPressStart = millis();
+    else if (millis() - bothPressStart > 800) {
+      motorEnabled = !motorEnabled;
+      bothPressStart = 0;
+      tft.fillRect(0, tft.height() - 20, tft.width(), 20, TFT_BLACK);
+      tft.setTextColor(motorEnabled ? TFT_GREEN : TFT_RED, TFT_BLACK);
+      tft.drawString(motorEnabled ? "MOTOR: ON" : "MOTOR: OFF", 5, tft.height() - 20, 2);
+      delay(500);
+    }
+  } else {
+    bothPressStart = 0;
+  }
 
   // --- Range button: long press to power off, short press toggles range ---
   static unsigned long rangePressStart = 0;
@@ -461,11 +522,26 @@ static float computeMedian(float *arr, int n) {
 }
 
 static void drawTempStats(float tMin, float tMax, float median) {
-  char buf[32]; tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  int textY = tft.height() - 45; int textX = 5;
-  snprintf(buf, sizeof(buf), "Min: %.1f", tMin); tft.drawString(buf, textX, textY, 2);
-  snprintf(buf, sizeof(buf), "Max: %.1f", tMax); tft.drawString(buf, textX, textY + 15, 2);
-  snprintf(buf, sizeof(buf), "Med: %.1f", median); tft.drawString(buf, textX, textY + 30, 2);
+  char buf[32];
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+
+  // Bottom row
+  int y = tft.height() - 20;
+  int x = 5;
+
+  // Min
+  snprintf(buf, sizeof(buf), "Min: %.1fC", tMin);
+  tft.drawString(buf, x, y, 2);
+  x += tft.textWidth(buf, 2) + 10;
+
+  // Median
+  snprintf(buf, sizeof(buf), "Med: %.1fC", median);
+  tft.drawString(buf, x, y, 2);
+  x += tft.textWidth(buf, 2) + 10;
+
+  // Max
+  snprintf(buf, sizeof(buf), "Max: %.1fC", tMax);
+  tft.drawString(buf, x, y, 2);
 }
 
 static float suppressAmbientNoise(float value, float ambient) {
@@ -547,8 +623,11 @@ static void drawHeatmap(const float *pix, float tMin, float tMax) {
   tft.endWrite();
 }
 
-// Servo movement control
 static void trackHottestPixel(const float *pixels) {
+  static float integral = 0.0f;
+  static int lastPulse = 1500;
+  static float lastOffset = 0.0f;
+
   int hottestIndex = 0;
   float maxTemp = pixels[0];
   for (int i = 1; i < AMG88xx_PIXEL_ARRAY_SIZE; i++) {
@@ -560,25 +639,35 @@ static void trackHottestPixel(const float *pixels) {
 
   int x = hottestIndex % GRID_W;
   int centerX = GRID_W / 2;
+  float offset = (centerX - x) / (float)centerX;  // -1 to +1
 
-  // Calculate offset (-1 = far left, +1 = far right)
-  float offset = (centerX - x) / (float)centerX;  // invert direction
-
-  // Deadband for stability
-  if (fabs(offset) < 0.3f) {
-    servo.writeMicroseconds(1500);  // stop
+  // Deadband
+  if (fabs(offset) < 0.2f) {
+    servo.writeMicroseconds(1500);
+    integral = 0;
     return;
   }
+  
+  if (!motorEnabled) {
+    servo.writeMicroseconds(1500);
+    return;
+  }
+  
+  integral += offset * 0.05f;               // small accumulation
+  float derivative = offset - lastOffset;   // change rate
+  lastOffset = offset;
 
-  // Simple proportional control
-  int speed = 80 * offset; // tune factor
-  int pulse = 1500 + speed;
+  float control = kp * offset + ki * integral + kd * derivative;
 
-  if (pulse < 1000) pulse = 1000;
-  if (pulse > 2000) pulse = 2000;
+  // smooth the step
+  int pulse = 1500 + (int)control;
+  pulse = constrain(pulse, 1000, 2000);
+  pulse = (int)(0.7f * lastPulse + 0.3f * pulse);
+  lastPulse = pulse;
 
   servo.writeMicroseconds(pulse);
 }
+
 
 // Main
 void setup() {
@@ -719,7 +808,7 @@ void loop() {
   else { drawHeatmap(framePixels, tMin, tMax); }
 
   // Overlay: temporarily set rotation to draw UI consistently
-  uint8_t prevRot = tft.getRotation(); tft.setRotation(1);
+  uint8_t prevRot = tft.getRotation(); tft.setRotation(3);
   drawTempStats(tMin, tMax, medianTemp);
   float battV = readBatteryVoltage(); int battW = 32, battH = 14; int battX = tft.width() - battW - 6; int battY = 6; drawBatteryIndicator(battX, battY, battW, battH, battV);
   tft.setRotation(prevRot);
@@ -728,23 +817,3 @@ void loop() {
   delay(60);
   for (int i = 0; i < 6; i++) { server.handleClient(); delay(15); }
 }
-// This was tested using the AI Thinker board and worked
-// #include <ESP32Servo.h>
-
-// Servo servo;
-// int servoPin = 27;  // GPIO 26 works well
-
-// void setup() {
-//   psramInit(); // optional safe call
-//   servo.attach(servoPin);
-// }
-
-// void loop() {
-//   servo.writeMicroseconds(1500); // stop
-//   delay(2000);
-//   servo.writeMicroseconds(1000); // full reverse
-//   delay(2000);
-//   servo.writeMicroseconds(2000); // full forward
-//   delay(2000);
-// }
- 
