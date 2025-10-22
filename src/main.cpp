@@ -11,7 +11,9 @@
 #include <TFT_eSPI.h>
 #include <algorithm>
 #include <cmath>
-#include <ArduinoOTA.h>
+#include <ESP32Servo.h>
+Servo servo;
+const int SERVO_PIN = 27;
 
 #ifndef WIFI_PASSWORD
 #define WIFI_PASSWORD "thermal123"
@@ -26,6 +28,8 @@ static const int GRID_W = 8;
 static const int GRID_H = 8;
 float pixels[AMG88xx_PIXEL_ARRAY_SIZE];
 float displayPixels[AMG88xx_PIXEL_ARRAY_SIZE];
+bool useGrayscale = false;
+
 
 // Screen size (T-Display)
 #define SCREEN_W 240
@@ -365,7 +369,6 @@ static void handleSettingsPost() {
   }
   if (doc.containsKey("useInterpolation")) useInterpolation = doc["useInterpolation"].as<bool>();
 
-
   if (tuningChanged) autoRangeInitialized = false;
   handleSettingsGet();
 }
@@ -397,7 +400,15 @@ static uint16_t thermalGradient(float ratio) {
   return tft.color565(r,g,b);
 }
 static uint16_t tempToColor(float temp, float tMin, float tMax) {
-  float ratio = (temp - tMin) / (tMax - tMin); ratio = gammaAdjust(ratio, 0.6f); return thermalGradient(ratio);
+  float ratio = (temp - tMin) / (tMax - tMin);
+  ratio = gammaAdjust(ratio, 0.6f);
+
+  if (useGrayscale) {
+    uint8_t v = (uint8_t)(255 * ratio);
+    return tft.color565(v, v, v);
+  } else {
+    return thermalGradient(ratio);
+  }
 }
 
 // Buttons
@@ -406,17 +417,36 @@ bool lastRangeState = HIGH;  unsigned long lastRangeToggle = 0;
 
 static void checkButtons() {
   int interpReading = digitalRead(BUTTON_INTERP);
+  int rangeReading  = digitalRead(BUTTON_RANGE);
+
+  // --- Interpolation button: short press toggles grayscale, long press toggles interpolation ---
+  static unsigned long interpPressStart = 0;
   if (interpReading == LOW && lastInterpState == HIGH) interpPressStart = millis();
   if (interpReading == HIGH && lastInterpState == LOW) {
     unsigned long pressDuration = millis() - interpPressStart;
-    if (pressDuration < 2000) useInterpolation = !useInterpolation;
+    if (pressDuration < 800) useGrayscale = !useGrayscale;  // short press = toggle grayscale
+    else useInterpolation = !useInterpolation;              // long press = toggle interpolation
   }
-  if (interpReading == LOW && millis() - interpPressStart > 2000) powerOff();
   lastInterpState = interpReading;
 
-  int rangeReading = digitalRead(BUTTON_RANGE);
-  if (rangeReading == LOW && lastRangeState == HIGH && millis() - lastRangeToggle > 250) {
-    useManualRange = !useManualRange; lastRangeToggle = millis(); autoRangeInitialized = false;
+
+  // --- Range button: long press to power off, short press toggles range ---
+  static unsigned long rangePressStart = 0;
+  if (rangeReading == LOW && lastRangeState == HIGH) rangePressStart = millis();
+  if (rangeReading == HIGH && lastRangeState == LOW) {
+    unsigned long pressDuration = millis() - rangePressStart;
+    if (pressDuration < 2000) {
+      // short press toggles manual range
+      if (millis() - lastRangeToggle > 250) {
+        useManualRange = !useManualRange;
+        lastRangeToggle = millis();
+        autoRangeInitialized = false;
+      }
+    }
+  }
+  if (rangeReading == LOW && millis() - rangePressStart > 2000) {
+    // long press powers off
+    powerOff();
   }
   lastRangeState = rangeReading;
 }
@@ -517,6 +547,39 @@ static void drawHeatmap(const float *pix, float tMin, float tMax) {
   tft.endWrite();
 }
 
+// Servo movement control
+static void trackHottestPixel(const float *pixels) {
+  int hottestIndex = 0;
+  float maxTemp = pixels[0];
+  for (int i = 1; i < AMG88xx_PIXEL_ARRAY_SIZE; i++) {
+    if (pixels[i] > maxTemp) {
+      maxTemp = pixels[i];
+      hottestIndex = i;
+    }
+  }
+
+  int x = hottestIndex % GRID_W;
+  int centerX = GRID_W / 2;
+
+  // Calculate offset (-1 = far left, +1 = far right)
+  float offset = (centerX - x) / (float)centerX;  // invert direction
+
+  // Deadband for stability
+  if (fabs(offset) < 0.3f) {
+    servo.writeMicroseconds(1500);  // stop
+    return;
+  }
+
+  // Simple proportional control
+  int speed = 80 * offset; // tune factor
+  int pulse = 1500 + speed;
+
+  if (pulse < 1000) pulse = 1000;
+  if (pulse > 2000) pulse = 2000;
+
+  servo.writeMicroseconds(pulse);
+}
+
 // Main
 void setup() {
   Serial.begin(115200);
@@ -540,57 +603,70 @@ void setup() {
   tft.drawString("Thermal Imager Init OK", 10, 10, 2);
   tft.drawString("Starting Access Point...", 10, 30, 2);
 
-  // Try to connect to local Wi-Fi first
-  WiFi.mode(WIFI_STA);
-  WiFi.begin("Advanced Alien Technology Mk II", "uireo-89pqk-qsknl");
+  // Start as WiFi access point so clients can connect directly to the ESP
+  WiFi.mode(WIFI_AP);
+  // Build a short, simple SSID based on device MAC for uniqueness
+  String baseSsid = "ThermalCam-";
+  String initMac = WiFi.macAddress();
+  String initSuffix;
+  int initLen = initMac.length();
+  if (initLen >= 5) initSuffix = initMac.substring(initLen - 5);
+  else initSuffix = initMac;
+  initSuffix.replace(":", "");
+  String apSsid = baseSsid + initSuffix;
+  // Explicitly set AP IP and subnet (common default)
+  IPAddress apLocal(192,168,4,1);
+  IPAddress apGateway(192,168,4,1);
+  IPAddress apSubnet(255,255,255,0);
+  WiFi.softAPConfig(apLocal, apGateway, apSubnet);
+  bool apStarted = false;
+  // Start AP on channel 1, not hidden
+  #ifdef WIFI_PASSWORD
+    if (strlen(WIFI_PASSWORD) > 0) apStarted = WiFi.softAP(apSsid.c_str(), WIFI_PASSWORD, 1, 0, 4);
+    else apStarted = WiFi.softAP(apSsid.c_str(), NULL, 1, 0, 4);
+  #else
+    apStarted = WiFi.softAP(apSsid.c_str(), NULL, 1, 0, 4);
+  #endif
 
-  unsigned long startAttempt = millis();
-  const unsigned long timeout = 10000;  // 10 seconds
-  bool wifiConnected = false;
-
-  tft.fillScreen(TFT_BLACK);
-  tft.setTextColor(TFT_WHITE);
-  tft.drawString("Connecting to Wi-Fi...", 10, 10, 2);
-
-  while (millis() - startAttempt < timeout) {
-    if (WiFi.status() == WL_CONNECTED) { wifiConnected = true; break; }
-    delay(500);
-    tft.fillRect(10, 30, 200, 16, TFT_BLACK);
-    tft.drawString(String(".").c_str(), 10, 30, 2);
-  }
-
-  if (wifiConnected) {
-    deviceIp = WiFi.localIP().toString();
-    tft.fillScreen(TFT_BLACK);
-    tft.drawString("Wi-Fi connected", 10, 10, 2);
-    tft.drawString(deviceIp, 10, 30, 2);
+  if (apStarted) {
+    IPAddress apIP = WiFi.softAPIP(); deviceIp = apIP.toString();
+    Serial.print("AP started, SSID: "); Serial.print(apSsid); Serial.print(" IP: "); Serial.println(deviceIp);
+    // indicate whether AP is secured (password set) or open
+    bool apSecured = false;
+    #ifdef WIFI_PASSWORD
+      if (strlen(WIFI_PASSWORD) > 0) apSecured = true;
+    #endif
+    Serial.print("AP mode: "); Serial.println(apSecured ? "WPA2-PSK" : "OPEN");
+    tft.fillRect(0, 30, SCREEN_W, 40, TFT_BLACK);
+    tft.drawString("AP started", 10, 30, 2);
+    String ipText = String("AP: ") + deviceIp; tft.drawString(ipText.c_str(), 10, 50, 2);
+    tft.drawString(apSecured ? "Secured" : "Open", 10, 70, 2);
+    // Start mDNS responder so clients can access via hostname.local
+    String mac = WiFi.softAPmacAddress();
+  // create short suffix from MAC (last 5 chars) and remove colons
+  String macSuffix;
+  int len = mac.length();
+  if (len >= 5) macSuffix = mac.substring(len - 5);
+  else macSuffix = mac;
+  macSuffix.replace(":", "");
+  // sanitize SSID for hostname: keep alnum and replace others with '-'
+  String host = apSsid;
+  for (size_t i = 0; i < host.length(); i++) { char c = host.charAt(i); if (!isalnum(c)) host.setCharAt(i, '-'); }
+  String mdnsName = host + "-" + macSuffix;
+  // force lowercase
+  for (size_t i = 0; i < mdnsName.length(); i++) mdnsName.setCharAt(i, tolower(mdnsName.charAt(i)));
     if (MDNS.begin("thermalcam")) {
-      Serial.println("mDNS responder started: http://thermalcam.local/");
-      tft.drawString("mDNS active", 10, 50, 2);
+    Serial.println("mDNS responder started: http://thermalcam.local/");
+    
     } else {
       Serial.println("mDNS failed to start");
-      tft.drawString("mDNS failed", 10, 50, 2);
     }
   } else {
-    // Fallback to Access Point mode
-    Serial.println("Wi-Fi connect failed, starting AP mode...");
-    tft.fillScreen(TFT_BLACK);
-    tft.drawString("Wi-Fi failed", 10, 10, 2);
-    tft.drawString("Starting AP...", 10, 30, 2);
-
-    WiFi.mode(WIFI_AP);
-    String apSsid = "ThermalCam-" + WiFi.macAddress().substring(12);
-    IPAddress apIP(192, 168, 4, 1);
-    WiFi.softAPConfig(apIP, apIP, IPAddress(255,255,255,0));
-    WiFi.softAP(apSsid.c_str(), "thermal123");
-    deviceIp = WiFi.softAPIP().toString();
-
-    tft.fillScreen(TFT_BLACK);
-    tft.drawString("AP Mode", 10, 10, 2);
-    tft.drawString(apSsid, 10, 30, 2);
-    tft.drawString(deviceIp, 10, 50, 2);
+    deviceIp = "not started";
+    Serial.println("Failed to start AP");
+    tft.fillRect(0, 30, SCREEN_W, 40, TFT_BLACK);
+    tft.drawString("AP failed", 10, 30, 2);
   }
-
 
   server.on("/", handleIndex);
   server.on("/frame", HTTP_GET, handleFrame);
@@ -601,6 +677,9 @@ void setup() {
 
   delay(500);
   tft.fillScreen(TFT_BLACK);
+  servo.attach(SERVO_PIN);
+servo.writeMicroseconds(1500);  // neutral stop
+
 }
 
 void loop() {
@@ -611,6 +690,7 @@ void loop() {
 
   amg.readPixels(pixels);
   float medianTemp = computeMedian(pixels, AMG88xx_PIXEL_ARRAY_SIZE);
+  trackHottestPixel(pixels);
 
   const float *framePixels = pixels;
   float tMin, tMax;
@@ -624,7 +704,6 @@ void loop() {
   }
 
   checkButtons();
-
   // Rotate for web feed (flip to match orientation)
   for (int y = 0; y < GRID_H; y++) {
     for (int x = 0; x < GRID_W; x++) {
@@ -649,3 +728,23 @@ void loop() {
   delay(60);
   for (int i = 0; i < 6; i++) { server.handleClient(); delay(15); }
 }
+// This was tested using the AI Thinker board and worked
+// #include <ESP32Servo.h>
+
+// Servo servo;
+// int servoPin = 27;  // GPIO 26 works well
+
+// void setup() {
+//   psramInit(); // optional safe call
+//   servo.attach(servoPin);
+// }
+
+// void loop() {
+//   servo.writeMicroseconds(1500); // stop
+//   delay(2000);
+//   servo.writeMicroseconds(1000); // full reverse
+//   delay(2000);
+//   servo.writeMicroseconds(2000); // full forward
+//   delay(2000);
+// }
+ 
