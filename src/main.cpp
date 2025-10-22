@@ -33,7 +33,6 @@ float kp = 70.0f; //Controls oscillation
 float ki = 10.0f; //Controls steady state error
 float kd = 40.0f; //Controls overshoot
 bool useGrayscale = false;
-bool motorEnabled = true;
 
 // Screen size (T-Display)
 #define SCREEN_W 240
@@ -475,21 +474,6 @@ static void checkButtons() {
   }
   lastInterpState = interpReading;
 
-  // --- Combined press: toggle motor function ---
-  static unsigned long bothPressStart = 0;
-  if (interpReading == LOW && rangeReading == LOW) {
-    if (bothPressStart == 0) bothPressStart = millis();
-    else if (millis() - bothPressStart > 800) {
-      motorEnabled = !motorEnabled;
-      bothPressStart = 0;
-      tft.fillRect(0, tft.height() - 20, tft.width(), 20, TFT_BLACK);
-      tft.setTextColor(motorEnabled ? TFT_GREEN : TFT_RED, TFT_BLACK);
-      tft.drawString(motorEnabled ? "MOTOR: ON" : "MOTOR: OFF", 5, tft.height() - 20, 2);
-      delay(500);
-    }
-  } else {
-    bothPressStart = 0;
-  }
 
   // --- Range button: long press to power off, short press toggles range ---
   static unsigned long rangePressStart = 0;
@@ -647,12 +631,7 @@ static void trackHottestPixel(const float *pixels) {
     integral = 0;
     return;
   }
-  
-  if (!motorEnabled) {
-    servo.writeMicroseconds(1500);
-    return;
-  }
-  
+
   integral += offset * 0.05f;               // small accumulation
   float derivative = offset - lastOffset;   // change rate
   lastOffset = offset;
