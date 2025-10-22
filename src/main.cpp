@@ -11,6 +11,9 @@
 #include <TFT_eSPI.h>
 #include <algorithm>
 #include <cmath>
+#include <ESP32Servo.h>
+Servo servo;
+const int SERVO_PIN = 27;
 
 #ifndef WIFI_PASSWORD
 #define WIFI_PASSWORD "thermal123"
@@ -544,6 +547,39 @@ static void drawHeatmap(const float *pix, float tMin, float tMax) {
   tft.endWrite();
 }
 
+// Servo movement control
+static void trackHottestPixel(const float *pixels) {
+  int hottestIndex = 0;
+  float maxTemp = pixels[0];
+  for (int i = 1; i < AMG88xx_PIXEL_ARRAY_SIZE; i++) {
+    if (pixels[i] > maxTemp) {
+      maxTemp = pixels[i];
+      hottestIndex = i;
+    }
+  }
+
+  int x = hottestIndex % GRID_W;
+  int centerX = GRID_W / 2;
+
+  // Calculate offset (-1 = far left, +1 = far right)
+  float offset = (centerX - x) / (float)centerX;  // invert direction
+
+  // Deadband for stability
+  if (fabs(offset) < 0.3f) {
+    servo.writeMicroseconds(1500);  // stop
+    return;
+  }
+
+  // Simple proportional control
+  int speed = 80 * offset; // tune factor
+  int pulse = 1500 + speed;
+
+  if (pulse < 1000) pulse = 1000;
+  if (pulse > 2000) pulse = 2000;
+
+  servo.writeMicroseconds(pulse);
+}
+
 // Main
 void setup() {
   Serial.begin(115200);
@@ -641,6 +677,9 @@ void setup() {
 
   delay(500);
   tft.fillScreen(TFT_BLACK);
+  servo.attach(SERVO_PIN);
+servo.writeMicroseconds(1500);  // neutral stop
+
 }
 
 void loop() {
@@ -651,6 +690,7 @@ void loop() {
 
   amg.readPixels(pixels);
   float medianTemp = computeMedian(pixels, AMG88xx_PIXEL_ARRAY_SIZE);
+  trackHottestPixel(pixels);
 
   const float *framePixels = pixels;
   float tMin, tMax;
