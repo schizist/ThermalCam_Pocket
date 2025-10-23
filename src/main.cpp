@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cmath>
 #include <ESP32Servo.h>
+#include <SPIFFS.h>
 Servo servo;
 const int SERVO_PIN = 27;
 
@@ -33,6 +34,8 @@ float kp = 70.0f; //Controls oscillation
 float ki = 10.0f; //Controls steady state error
 float kd = 40.0f; //Controls overshoot
 bool useGrayscale = false;
+int currentPulse = 1500;
+
 
 // Screen size (T-Display)
 #define SCREEN_W 240
@@ -653,14 +656,27 @@ static void trackHottestPixel(const float *pixels) {
   pulse = constrain(pulse, 1000, 2000);
   pulse = (int)(0.7f * lastPulse + 0.3f * pulse);
   lastPulse = pulse;
-
+  int currentPulse = pulse;
   servo.writeMicroseconds(pulse);
 }
 
+static void logFrame(float tMin, float tMedian, float tMax, int servoPulse) {
+  fs::File logfile = SPIFFS.open("/thermal_log.csv", FILE_APPEND);
+  if (!logfile) return;
+  unsigned long now = millis();
+  logfile.printf("%lu,%.2f,%.2f,%.2f,%d,%.1f,%.1f,%.1f\n",
+                 now, tMin, tMedian, tMax, servoPulse, kp, ki, kd);
+  logfile.close();
+}
 
 // Main
 void setup() {
   Serial.begin(115200);
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS mount failed");
+  } else {
+    Serial.println("SPIFFS ready");
+  }
   Wire.begin(21, 22);
 
   tft.init();
@@ -805,4 +821,6 @@ void loop() {
   // Small pacing and allow web server to run
   delay(60);
   for (int i = 0; i < 6; i++) { server.handleClient(); delay(15); }
+  logFrame(latestFrameMin, latestFrameMedian, latestFrameMax, currentPulse);
+
 }
