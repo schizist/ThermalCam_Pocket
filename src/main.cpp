@@ -460,28 +460,34 @@ static uint16_t tempToColor(float temp, float tMin, float tMax) {
 bool lastInterpState = HIGH; unsigned long interpPressStart = 0;
 bool lastRangeState = HIGH;  unsigned long lastRangeToggle = 0;
 
+static bool motorEnabled = true;  // new global toggle state
+
 static void checkButtons() {
   int interpReading = digitalRead(BUTTON_INTERP);
   int rangeReading  = digitalRead(BUTTON_RANGE);
 
-  // --- Interpolation button: short press toggles grayscale, long press toggles interpolation ---
+  // --- Interp button: short press toggles grayscale, long press toggles motor enable ---
   static unsigned long interpPressStart = 0;
   if (interpReading == LOW && lastInterpState == HIGH) interpPressStart = millis();
   if (interpReading == HIGH && lastInterpState == LOW) {
     unsigned long pressDuration = millis() - interpPressStart;
-    if (pressDuration < 800) useGrayscale = !useGrayscale;  // short press = toggle grayscale
-    else useInterpolation = !useInterpolation;              // long press = toggle interpolation
+    if (pressDuration < 800) {
+      useGrayscale = !useGrayscale;  // short press
+    } else {
+      motorEnabled = !motorEnabled;  // long press toggles motor enable
+      if (!motorEnabled) {
+        servo.writeMicroseconds(1500); // stop motor immediately
+      }
+    }
   }
   lastInterpState = interpReading;
 
-
-  // --- Range button: long press to power off, short press toggles range ---
+  // --- Range button: long press powers off, short press toggles range ---
   static unsigned long rangePressStart = 0;
   if (rangeReading == LOW && lastRangeState == HIGH) rangePressStart = millis();
   if (rangeReading == HIGH && lastRangeState == LOW) {
     unsigned long pressDuration = millis() - rangePressStart;
     if (pressDuration < 2000) {
-      // short press toggles manual range
       if (millis() - lastRangeToggle > 250) {
         useManualRange = !useManualRange;
         lastRangeToggle = millis();
@@ -490,11 +496,11 @@ static void checkButtons() {
     }
   }
   if (rangeReading == LOW && millis() - rangePressStart > 2000) {
-    // long press powers off
     powerOff();
   }
   lastRangeState = rangeReading;
 }
+
 
 // Stats and filtering
 static float computeMedian(float *arr, int n) {
@@ -608,6 +614,10 @@ static void drawHeatmap(const float *pix, float tMin, float tMax) {
 }
 
 static void trackHottestPixel(const float *pixels) {
+  if (!motorEnabled) {
+    servo.writeMicroseconds(1500); // keep motor stopped
+    return;
+  }
   static float integral = 0.0f;
   static int lastPulse = 1500;
   static float lastOffset = 0.0f;
