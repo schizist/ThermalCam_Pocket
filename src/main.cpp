@@ -220,7 +220,8 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
     .canvasWrap { display:inline-block; }
     canvas { border:1px solid #2f2f2f; border-radius:8px; display:block;
              width:min(90vw,320px); height:auto; aspect-ratio:16/9;
-             image-rendering:pixelated; background:#000; }
+             image-rendering:pixelated; background:#000;
+             transform:rotate(180deg); }
     .panel { background:#222c; border-radius:12px; padding:1rem 1.25rem;
              min-width:280px; box-shadow:0 10px 30px #0006; }
     .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(100px,1fr));
@@ -416,9 +417,6 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
     function drawHeatmap(pixels, minT, maxT, interp, mode, ambient) {
       mode = mode || 0; ambient = ambient || 0;
       ctx.clearRect(0, 0, 320, 180);
-      ctx.save();
-      ctx.translate(320, 180);
-      ctx.rotate(Math.PI);
       if (interp) {
         bilinear(pixels, interpBuf);
         const cw = 320/ISIZE, ch = 180/ISIZE;
@@ -433,7 +431,6 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
           ctx.fillRect(x*cw, y*ch, cw, ch);
         }
       }
-      ctx.restore();
     }
 
     // Tracking indicators drawn on top of the heatmap (same canvas).
