@@ -33,8 +33,13 @@ float displayPixels[AMG88xx_PIXEL_ARRAY_SIZE];
 float kp = 70.0f; //Controls oscillation
 float ki = 10.0f; //Controls steady state error
 float kd = 40.0f; //Controls overshoot
-bool useGrayscale = false;
+enum DisplayMode { MODE_THERMAL = 0, MODE_GRAYSCALE = 1, MODE_PERSON = 2 };
+DisplayMode displayMode = MODE_THERMAL;
 int currentPulse = 1500;
+
+// Skin-surface temp range for person tracking (Celsius)
+static const float HUMAN_TEMP_MIN = 26.0f;
+static const float HUMAN_TEMP_MAX = 38.0f;
 
 
 // Screen size (T-Display)
@@ -451,7 +456,14 @@ static uint16_t tempToColor(float temp, float tMin, float tMax) {
   float ratio = (temp - tMin) / (tMax - tMin);
   ratio = gammaAdjust(ratio, 0.6f);
 
-  if (useGrayscale) {
+  if (displayMode == MODE_PERSON) {
+    if (temp >= HUMAN_TEMP_MIN && temp <= HUMAN_TEMP_MAX) {
+      return TFT_WHITE;
+    } else {
+      uint8_t v = (uint8_t)(30 * ratio);
+      return tft.color565(0, 0, v);
+    }
+  } else if (displayMode == MODE_GRAYSCALE) {
     uint8_t v = (uint8_t)(255 * ratio);
     return tft.color565(v, v, v);
   } else {
@@ -475,7 +487,7 @@ static void checkButtons() {
   if (interpReading == HIGH && lastInterpState == LOW) {
     unsigned long pressDuration = millis() - interpPressStart;
     if (pressDuration < 800) {
-      useGrayscale = !useGrayscale;  // short press
+      displayMode = (DisplayMode)((displayMode + 1) % 3);  // cycle modes
     } else {
       motorEnabled = !motorEnabled;  // long press toggles motor enable
       if (!motorEnabled) {
@@ -512,6 +524,18 @@ static float computeMedian(float *arr, int n) {
   std::sort(temp, temp + n);
   if (n % 2 == 0) return 0.5f * (temp[n/2 - 1] + temp[n/2]);
   return temp[n/2];
+}
+
+static void drawModeIndicator() {
+  const char *label;
+  uint16_t color;
+  switch (displayMode) {
+    case MODE_GRAYSCALE: label = "GRAY";   color = TFT_WHITE;  break;
+    case MODE_PERSON:    label = "PERSON"; color = TFT_GREEN;  break;
+    default:             label = "THERMAL"; color = TFT_CYAN;  break;
+  }
+  tft.setTextColor(color, TFT_BLACK);
+  tft.drawString(label, 6, 6, 2);
 }
 
 static void drawTempStats(float tMin, float tMax, float median) {
@@ -618,45 +642,58 @@ static void drawHeatmap(const float *pix, float tMin, float tMax) {
 
 static void trackHottestPixel(const float *pixels) {
   if (!motorEnabled) {
-    servo.writeMicroseconds(1500); // keep motor stopped
+    servo.writeMicroseconds(1500);
     return;
   }
   static float integral = 0.0f;
   static int lastPulse = 1500;
   static float lastOffset = 0.0f;
 
-  int hottestIndex = 0;
-  float maxTemp = pixels[0];
-  for (int i = 1; i < AMG88xx_PIXEL_ARRAY_SIZE; i++) {
-    if (pixels[i] > maxTemp) {
-      maxTemp = pixels[i];
-      hottestIndex = i;
+  float targetX;
+
+  if (displayMode == MODE_PERSON) {
+    float sumX = 0, sumWeight = 0;
+    for (int i = 0; i < AMG88xx_PIXEL_ARRAY_SIZE; i++) {
+      if (pixels[i] >= HUMAN_TEMP_MIN && pixels[i] <= HUMAN_TEMP_MAX) {
+        sumX += (i % GRID_W);
+        sumWeight += 1.0f;
+      }
     }
+    if (sumWeight == 0) {
+      servo.writeMicroseconds(1500);
+      integral = 0;
+      return;
+    }
+    targetX = sumX / sumWeight;
+  } else {
+    int hottestIndex = 0;
+    float maxTemp = pixels[0];
+    for (int i = 1; i < AMG88xx_PIXEL_ARRAY_SIZE; i++) {
+      if (pixels[i] > maxTemp) { maxTemp = pixels[i]; hottestIndex = i; }
+    }
+    targetX = hottestIndex % GRID_W;
   }
 
-  int x = hottestIndex % GRID_W;
-  int centerX = GRID_W / 2;
-  float offset = (centerX - x) / (float)centerX;  // -1 to +1
+  float centerX = GRID_W / 2.0f;
+  float offset = (centerX - targetX) / centerX;  // -1 to +1
 
-  // Deadband
   if (fabs(offset) < 0.2f) {
     servo.writeMicroseconds(1500);
     integral = 0;
     return;
   }
 
-  integral += offset * 0.05f;               // small accumulation
-  float derivative = offset - lastOffset;   // change rate
+  integral += offset * 0.05f;
+  float derivative = offset - lastOffset;
   lastOffset = offset;
 
   float control = kp * offset + ki * integral + kd * derivative;
 
-  // smooth the step
   int pulse = 1500 + (int)control;
   pulse = constrain(pulse, 1000, 2000);
   pulse = (int)(0.7f * lastPulse + 0.3f * pulse);
   lastPulse = pulse;
-  int currentPulse = pulse;
+  currentPulse = pulse;
   servo.writeMicroseconds(pulse);
 }
 
@@ -814,6 +851,7 @@ void loop() {
 
   // Overlay: temporarily set rotation to draw UI consistently
   uint8_t prevRot = tft.getRotation(); tft.setRotation(3);
+  drawModeIndicator();
   drawTempStats(tMin, tMax, medianTemp);
   float battV = readBatteryVoltage(); int battW = 32, battH = 14; int battX = tft.width() - battW - 6; int battY = 6; drawBatteryIndicator(battX, battY, battW, battH, battV);
   tft.setRotation(prevRot);
