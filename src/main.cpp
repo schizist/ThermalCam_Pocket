@@ -22,8 +22,11 @@
 Servo servo;
 const int SERVO_PIN = 27;
 
+#ifndef WIFI_SSID
+#define WIFI_SSID ""
+#endif
 #ifndef WIFI_PASSWORD
-#define WIFI_PASSWORD "thermal123"
+#define WIFI_PASSWORD ""
 #endif
 
 WebServer server(80);
@@ -704,8 +707,8 @@ static void drawModeIndicator() {
   const char *lbl; uint16_t col;
   switch(displayMode){
     case MODE_GRAYSCALE: lbl="GRAY";    col=TFT_WHITE; break;
-    case MODE_PERSON:    lbl="PERSON";  col=TFT_GREEN; break;
-    default:             lbl="THERMAL"; col=TFT_CYAN;  break;
+    case MODE_PERSON:    lbl="THERMAL";  col=TFT_GREEN; break;
+    default:             lbl="PERSON"; col=TFT_CYAN;  break;
   }
   tft.setTextColor(col, TFT_BLACK);
   tft.drawString(lbl, 6, 6, 2);
@@ -970,35 +973,30 @@ void setup() {
 
   tft.setTextColor(TFT_WHITE);
   tft.drawString("Thermal Imager Init OK", 10, 10, 2);
-  tft.drawString("Starting Access Point...", 10, 30, 2);
+  tft.drawString("Connecting to WiFi...", 10, 30, 2);
 
-  WiFi.mode(WIFI_AP);
-  String mac = WiFi.macAddress();
-  String suf = mac.substring(mac.length()-5); suf.replace(":","");
-  String apSsid = "ThermalCam-" + suf;
-  IPAddress apIP(192,168,4,1);
-  WiFi.softAPConfig(apIP, apIP, IPAddress(255,255,255,0));
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-  bool ok = false;
-#ifdef WIFI_PASSWORD
-  ok = (strlen(WIFI_PASSWORD)>0)
-     ? WiFi.softAP(apSsid.c_str(), WIFI_PASSWORD, 1, 0, 4)
-     : WiFi.softAP(apSsid.c_str(), NULL, 1, 0, 4);
-#else
-  ok = WiFi.softAP(apSsid.c_str(), NULL, 1, 0, 4);
-#endif
+  unsigned long wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 15000) {
+    delay(500);
+  }
 
-  if (ok) {
-    deviceIp = WiFi.softAPIP().toString();
-    Serial.printf("AP: %s  IP: %s\n", apSsid.c_str(), deviceIp.c_str());
-    tft.fillRect(0,30,SCREEN_W,60,TFT_BLACK);
-    tft.drawString("AP: " + apSsid, 10, 30, 2);
-    tft.drawString(deviceIp, 10, 50, 2);
+  if (WiFi.status() == WL_CONNECTED) {
+    deviceIp = WiFi.localIP().toString();
+    Serial.printf("WiFi connected  IP: %s\n", deviceIp.c_str());
+    tft.fillRect(0, 30, SCREEN_W, 60, TFT_BLACK);
+    tft.drawString(deviceIp, 10, 30, 2);
+    tft.drawString("thermalcam.local", 10, 50, 2);
     if (MDNS.begin("thermalcam")) Serial.println("mDNS: http://thermalcam.local/");
   } else {
-    deviceIp = "not started";
-    Serial.println("AP failed");
-    tft.drawString("AP failed", 10, 30, 2);
+    deviceIp = "no wifi";
+    Serial.println("WiFi connection failed");
+    tft.fillRect(0, 30, SCREEN_W, 20, TFT_BLACK);
+    tft.setTextColor(TFT_RED);
+    tft.drawString("WiFi failed!", 10, 30, 2);
+    tft.setTextColor(TFT_WHITE);
   }
 
   server.on("/",         handleIndex);
@@ -1042,7 +1040,7 @@ void setup() {
 void loop() {
   ArduinoOTA.handle();
   server.handleClient();
-  deviceIp = WiFi.softAPIP().toString();
+  if (WiFi.status() == WL_CONNECTED) deviceIp = WiFi.localIP().toString();
 
   amg.readPixels(pixels);
   float medianTemp = computeMedian(pixels, AMG88xx_PIXEL_ARRAY_SIZE);
