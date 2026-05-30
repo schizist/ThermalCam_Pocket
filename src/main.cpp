@@ -1,5 +1,6 @@
 // Thermal Imager with Web UI and T-Display rendering
-// Rebuilt clean to fix previous merge artifacts and compile errors
+// v3: overshoot fix (filtered derivative, removed feedforward),
+//     scan mode when no target found, improved PID defaults
 
 #include <Arduino.h>
 #include <Wire.h>
@@ -13,6 +14,7 @@
 #include <cmath>
 #include <ESP32Servo.h>
 #include <SPIFFS.h>
+
 Servo servo;
 const int SERVO_PIN = 27;
 
@@ -29,60 +31,60 @@ static const int GRID_W = 8;
 static const int GRID_H = 8;
 float pixels[AMG88xx_PIXEL_ARRAY_SIZE];
 float displayPixels[AMG88xx_PIXEL_ARRAY_SIZE];
-// PID control for servo
-float kp = 70.0f; //Controls oscillation
-float ki = 10.0f; //Controls steady state error
-float kd = 40.0f; //Controls overshoot
+
+// PID — kff removed; derivative is now computed on a low-pass filtered error
+// to prevent noise-amplified kicks that cause overshoot.
+// Defaults chosen conservatively; tune up Kp first via web UI.
+float kp = 35.0f;
+float ki =  3.0f;
+float kd = 15.0f;
+
+// Scan behaviour
+// When no target is found the servo sweeps slowly across the full range.
+// SCAN_SPEED_US is added to currentPulse each loop tick (~75 ms effective).
+// Direction reverses at the pulse limits.
+static const int   SCAN_SPEED_US   = 8;    // µs per tick — slow deliberate sweep
+static const int   SCAN_MIN_PULSE  = 500;  // full 360° range lower bound
+static const int   SCAN_MAX_PULSE  = 2500; // full 360° range upper bound
+static int         scanDirection   = 1;    // +1 or -1
+
 enum DisplayMode { MODE_THERMAL = 0, MODE_GRAYSCALE = 1, MODE_PERSON = 2 };
 DisplayMode displayMode = MODE_THERMAL;
 int currentPulse = 1500;
 
-// Skin-surface temp range for person tracking (Celsius)
-static const float HUMAN_TEMP_MIN = 26.0f;
-static const float HUMAN_TEMP_MAX = 38.0f;
-
+// Dynamic human temp range — offset from median (ambient).
+// A pixel is "human" if it is HUMAN_ABOVE_MIN..HUMAN_ABOVE_MAX °C above ambient.
+static const float HUMAN_ABOVE_MIN = 1.5f;
+static const float HUMAN_ABOVE_MAX = 12.0f;
 
 // Screen size (T-Display)
 #define SCREEN_W 240
 #define SCREEN_H 135
 
-// Battery voltage reading
-#define BATTERY_PIN 34
+// Battery
+#define BATTERY_PIN             34
 #define BATTERY_VOLTAGE_DIVIDER 2.0f
-#define BATTERY_MIN_V 3.2f
-#define BATTERY_MAX_V 4.2f
+#define BATTERY_MIN_V           3.2f
+#define BATTERY_MAX_V           4.2f
 
 static float readBatteryVoltage() {
   int raw = analogRead(BATTERY_PIN);
-  float voltage = (raw / 4095.0f) * 3.3f * BATTERY_VOLTAGE_DIVIDER;
-  return voltage;
+  return (raw / 4095.0f) * 3.3f * BATTERY_VOLTAGE_DIVIDER;
 }
 
 static void drawBatteryIndicator(int x, int y, int w, int h, float voltage) {
   float pct = (voltage - BATTERY_MIN_V) / (BATTERY_MAX_V - BATTERY_MIN_V);
-  if (pct < 0) pct = 0; if (pct > 1) pct = 1;
-
-  // Body
+  pct = constrain(pct, 0.0f, 1.0f);
   tft.drawRect(x, y, w, h, TFT_WHITE);
-  // Terminal nub
-  int nubW = max(2, w / 8);
-  int nubH = max(2, h / 3);
+  int nubW = max(2, w / 8), nubH = max(2, h / 3);
   tft.fillRect(x + w, y + (h - nubH) / 2, nubW, nubH, TFT_WHITE);
-
-  // Fill
-  int innerW = w - 4;
-  int fillW = (int)roundf(innerW * pct);
+  int fillW = (int)roundf((w - 4) * pct);
   tft.fillRect(x + 2, y + 2, fillW, h - 4, (pct < 0.15f) ? TFT_RED : TFT_GREEN);
-
-  // Text percentage
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
   char buf[8];
-  int percent = (int)(pct * 100.0f + 0.5f);
-  if (percent > 100) percent = 100; if (percent < 0) percent = 0;
+  int percent = constrain((int)(pct * 100.0f + 0.5f), 0, 100);
   snprintf(buf, sizeof(buf), "%d%%", percent);
-  int textX = x - 2 - tft.textWidth(buf, 2);
-  int textY = y + (h - 16) / 2;
-  tft.drawString(buf, textX, textY, 2);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString(buf, x - 2 - tft.textWidth(buf, 2), y + (h - 16) / 2, 2);
 }
 
 // Interpolation
@@ -96,38 +98,105 @@ float interpBuf[INTERP_W * INTERP_H];
 #define BUTTON_RANGE  35  // GPIO35
 
 bool useInterpolation = true;
-bool useManualRange = false;
-float manualMin = 8.50f;
+bool useManualRange   = false;
+float manualMin =  8.50f;
 float manualMax = 30.50f;
 
-// Runtime-tunable auto-range parameters
-static const float DEFAULT_AMBIENT_DEADBAND = 0.1f;
-static const float DEFAULT_AUTO_RANGE_PAD   = 0.01f;
-static const float DEFAULT_MIN_AUTO_RANGE   = 10.0f;
+// Auto-range parameters
+static const float DEFAULT_AMBIENT_DEADBAND    = 0.1f;
+static const float DEFAULT_AUTO_RANGE_PAD      = 0.01f;
+static const float DEFAULT_MIN_AUTO_RANGE      = 10.0f;
 static const float DEFAULT_RANGE_EXPAND_RATE   = 0.55f;
 static const float DEFAULT_RANGE_CONTRACT_RATE = 0.50f;
 
-float ambientDeadband = DEFAULT_AMBIENT_DEADBAND;
-float autoRangePad = DEFAULT_AUTO_RANGE_PAD;
-float minAutoRange = DEFAULT_MIN_AUTO_RANGE;
-float rangeExpandRate = DEFAULT_RANGE_EXPAND_RATE;
+float ambientDeadband   = DEFAULT_AMBIENT_DEADBAND;
+float autoRangePad      = DEFAULT_AUTO_RANGE_PAD;
+float minAutoRange      = DEFAULT_MIN_AUTO_RANGE;
+float rangeExpandRate   = DEFAULT_RANGE_EXPAND_RATE;
 float rangeContractRate = DEFAULT_RANGE_CONTRACT_RATE;
 
-// Smoothing state
-bool autoRangeInitialized = false;
+bool  autoRangeInitialized = false;
 float smoothRangeMin = 0.0f;
 float smoothRangeMax = 0.0f;
 
-// Stream cache for web
-bool frameAvailable = false;
-float latestFrame[AMG88xx_PIXEL_ARRAY_SIZE];
-float latestFrameMin = 0.0f;
-float latestFrameMax = 0.0f;
-float latestFrameMedian = 0.0f;
+// Web frame cache
+bool          frameAvailable    = false;
+float         latestFrame[AMG88xx_PIXEL_ARRAY_SIZE];
+float         latestFrameMin    = 0.0f;
+float         latestFrameMax    = 0.0f;
+float         latestFrameMedian = 0.0f;
 unsigned long latestFrameMillis = 0;
-String deviceIp;
+String        deviceIp;
 
+// ─────────────────────────────────────────────
+// Blob detection
+// ─────────────────────────────────────────────
+// Returns true and writes centroid of the largest connected blob of
+// human-temperature pixels.  Uses a two-pass union-find on the 8×8 grid.
+static bool getPersonCentroid(const float *pix, float ambientTemp,
+                               float *outX, float *outY) {
+  const float tMin = ambientTemp + HUMAN_ABOVE_MIN;
+  const float tMax = ambientTemp + HUMAN_ABOVE_MAX;
+
+  int label[AMG88xx_PIXEL_ARRAY_SIZE] = {0};
+  int parent[AMG88xx_PIXEL_ARRAY_SIZE + 1];
+  for (int i = 0; i <= AMG88xx_PIXEL_ARRAY_SIZE; i++) parent[i] = i;
+  int nextLabel = 1;
+
+  // Path-compressed find
+  auto findRoot = [&](int x) -> int {
+    while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; }
+    return x;
+  };
+  auto unite = [&](int a, int b) {
+    a = findRoot(a); b = findRoot(b);
+    if (a != b) parent[b] = a;
+  };
+
+  // First pass: label + union
+  for (int y = 0; y < GRID_H; y++) {
+    for (int x = 0; x < GRID_W; x++) {
+      int i = y * GRID_W + x;
+      if (pix[i] < tMin || pix[i] > tMax) continue;
+      int L = (x > 0)      ? label[i - 1]     : 0;
+      int A = (y > 0)      ? label[i - GRID_W] : 0;
+      if      (L && A) { label[i] = L; unite(L, A); }
+      else if (L)      { label[i] = L; }
+      else if (A)      { label[i] = A; }
+      else             { label[i] = nextLabel++; }
+    }
+  }
+
+  // Second pass: accumulate blob stats by root
+  int   blobCount[AMG88xx_PIXEL_ARRAY_SIZE + 1] = {0};
+  float blobSumX [AMG88xx_PIXEL_ARRAY_SIZE + 1] = {0};
+  float blobSumY [AMG88xx_PIXEL_ARRAY_SIZE + 1] = {0};
+  for (int y = 0; y < GRID_H; y++) {
+    for (int x = 0; x < GRID_W; x++) {
+      int i = y * GRID_W + x;
+      if (!label[i]) continue;
+      int root = findRoot(label[i]);
+      blobCount[root]++;
+      blobSumX[root] += x;
+      blobSumY[root] += y;
+    }
+  }
+
+  // Pick largest blob (≥2 pixels required)
+  int bestLabel = 0, bestSize = 1;
+  for (int l = 1; l < nextLabel; l++) {
+    if (blobCount[l] > bestSize) { bestSize = blobCount[l]; bestLabel = l; }
+  }
+  if (!bestLabel) return false;
+
+  *outX = blobSumX[bestLabel] / bestSize;
+  *outY = blobSumY[bestLabel] / bestSize;
+  return true;
+}
+
+// ─────────────────────────────────────────────
 // Web page
+// ─────────────────────────────────────────────
 static const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="en">
@@ -140,25 +209,38 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
     body { margin:0 auto; max-width:960px; padding:1.5rem; background:#111; color:#f0f0f0; }
     h1 { font-weight:600; margin-bottom:1rem; text-align:center; }
     .viewer { display:flex; flex-wrap:wrap; gap:1.5rem; justify-content:center; align-items:flex-start; }
-    canvas { border:1px solid #2f2f2f; border-radius:8px; width:min(90vw,320px); height:min(90vw,320px); image-rendering:pixelated; background:#000; }
-    .panel { background:#222c; border-radius:12px; padding:1rem 1.25rem; min-width:280px; box-shadow:0 10px 30px #0006; }
-    .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:.75rem; margin-bottom:1rem; }
+    .canvasWrap { position:relative; display:inline-block; }
+    canvas { border:1px solid #2f2f2f; border-radius:8px; display:block;
+             width:min(90vw,320px); height:min(90vw,320px);
+             image-rendering:pixelated; background:#000; }
+    #overlay { position:absolute; top:0; left:0; pointer-events:none;
+               width:min(90vw,320px); height:min(90vw,320px); }
+    .panel { background:#222c; border-radius:12px; padding:1rem 1.25rem;
+             min-width:280px; box-shadow:0 10px 30px #0006; }
+    .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(100px,1fr));
+             gap:.75rem; margin-bottom:1rem; }
     .stat { background:#fff1; border-radius:8px; padding:.75rem; text-align:center; }
-    .stat span { display:block; font-size:1.35rem; font-weight:600; margin-top:.25rem; }
+    .stat span { display:block; font-size:1.25rem; font-weight:600; margin-top:.25rem; }
     label { display:flex; flex-direction:column; gap:.35rem; margin-bottom:1rem; font-size:.95rem; }
     input[type=range] { width:100%; }
     .toggle-row { display:flex; gap:1rem; margin-bottom:1rem; align-items:center; flex-wrap:wrap; }
     .toggle-row label { flex-direction:row; align-items:center; gap:.5rem; margin:0; }
-    .status { font-size:.9rem; opacity:.8; }
+    .status { font-size:.9rem; opacity:.8; margin-bottom:.3rem; }
     .group-title { margin:1.25rem 0 .75rem; font-size:1rem; font-weight:600; letter-spacing:.02em; }
-    .setting-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:.75rem; margin-bottom:.75rem; }
-    input[type=number] { background:#1e1e1e; border:1px solid #333; border-radius:6px; color:#f0f0f0; padding:.45rem .5rem; }
+    .state-badge { display:inline-block; padding:.2rem .6rem; border-radius:6px;
+                   font-size:.85rem; font-weight:600; margin-left:.5rem; }
+    .state-track { background:#1a4a1a; color:#4f4; }
+    .state-hold  { background:#4a3a00; color:#fc0; }
+    .state-scan  { background:#2a1a4a; color:#a8f; }
   </style>
 </head>
 <body>
   <h1>ThermalCam Live Viewer</h1>
   <div class="viewer">
-    <canvas id="heatmap" width="320" height="320"></canvas>
+    <div class="canvasWrap">
+      <canvas id="heatmap" width="320" height="320"></canvas>
+      <canvas id="overlay" width="320" height="320"></canvas>
+    </div>
     <div class="panel">
       <div class="stats">
         <div class="stat">Min<span id="stat-min">--</span></div>
@@ -169,639 +251,677 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
         <label><input type="checkbox" id="toggleManual"> Manual range</label>
         <label><input type="checkbox" id="toggleInterp"> Interpolation</label>
       </div>
-      <label for="sliderMin">Manual minimum: <strong><span id="sliderMinValue">--</span> C</strong>
+      <label>Manual minimum: <strong><span id="sliderMinValue">--</span> °C</strong>
         <input type="range" id="sliderMin" min="-20" max="120" step="0.1">
       </label>
-      <label for="sliderMax">Manual maximum: <strong><span id="sliderMaxValue">--</span> C</strong>
+      <label>Manual maximum: <strong><span id="sliderMaxValue">--</span> °C</strong>
         <input type="range" id="sliderMax" min="-20" max="120" step="0.1">
       </label>
       <div class="group-title">Servo PID</div>
-      <label for="kp">Kp: <strong><span id="kpVal">--</span></strong>
+      <label>Kp: <strong><span id="kpVal">--</span></strong>
         <input type="range" id="kp" min="0" max="200" step="1">
       </label>
-      <label for="ki">Ki: <strong><span id="kiVal">--</span></strong>
-        <input type="range" id="ki" min="0" max="50" step="1">
+      <label>Ki: <strong><span id="kiVal">--</span></strong>
+        <input type="range" id="ki" min="0" max="50" step="0.5">
       </label>
-      <label for="kd">Kd: <strong><span id="kdVal">--</span></strong>
+      <label>Kd: <strong><span id="kdVal">--</span></strong>
         <input type="range" id="kd" min="0" max="100" step="1">
       </label>
-      <!-- Auto range tuning removed from UI -->
-      <div class="status">IP address: <span id="ip-address">--</span></div>
+      <div class="status">State:
+        <span id="tracker-state" class="state-badge state-scan">SCAN</span>
+      </div>
+      <div class="status">Target: <span id="target-pos">--</span></div>
+      <div class="status">IP: <span id="ip-address">--</span></div>
       <div class="status">Last frame: <span id="last-frame">--</span></div>
     </div>
   </div>
   <script>
     const heatmap = document.getElementById('heatmap');
-    const ctx = heatmap.getContext('2d');
-    const statMin = document.getElementById('stat-min');
-    const statMax = document.getElementById('stat-max');
-    const statMedian = document.getElementById('stat-median');
-    const sliderMin = document.getElementById('sliderMin');
-    const sliderMax = document.getElementById('sliderMax');
-    const sliderMinValue = document.getElementById('sliderMinValue');
-    const sliderMaxValue = document.getElementById('sliderMaxValue');
-    const toggleManual = document.getElementById('toggleManual');
-    const toggleInterp = document.getElementById('toggleInterp');
-    const ipAddress = document.getElementById('ip-address');
-    const lastFrame = document.getElementById('last-frame');
-    const kpSlider = document.getElementById('kp');
-    const kiSlider = document.getElementById('ki');
-    const kdSlider = document.getElementById('kd');
-    const kpVal = document.getElementById('kpVal');
-    const kiVal = document.getElementById('kiVal');
-    const kdVal = document.getElementById('kdVal');
-
-    function updatePIDControls(data) {
-      kpSlider.value = data.kp;
-      kiSlider.value = data.ki;
-      kdSlider.value = data.kd;
-      kpVal.textContent = data.kp.toFixed(1);
-      kiVal.textContent = data.ki.toFixed(1);
-      kdVal.textContent = data.kd.toFixed(1);
-    }
-
-    kpSlider.addEventListener('input', () => {
-      kpVal.textContent = kpSlider.value;
-      queueSettingUpdate('kp', parseFloat(kpSlider.value));
-    });
-    kiSlider.addEventListener('input', () => {
-      kiVal.textContent = kiSlider.value;
-      queueSettingUpdate('ki', parseFloat(kiSlider.value));
-    });
-    kdSlider.addEventListener('input', () => {
-      kdVal.textContent = kdSlider.value;
-      queueSettingUpdate('kd', parseFloat(kdSlider.value));
-    });
-
-  // Auto-range tuning controls removed from UI; keep defaults in firmware
-
-    const GRID_SIZE = 8;
-    const UPSCALE = 8;
-    const INTERP_SIZE = GRID_SIZE * UPSCALE;
-    const interpBuffer = new Float32Array(INTERP_SIZE * INTERP_SIZE);
+    const overlay = document.getElementById('overlay');
+    const ctx  = heatmap.getContext('2d');
+    const octx = overlay.getContext('2d');
     ctx.imageSmoothingEnabled = false;
 
-    let pendingSettings = {};
-    let pendingTimeout = null;
-    let lastFrameReceived = 0;
+    const GRID = 8, UP = 8, ISIZE = GRID * UP;
+    const interpBuf = new Float32Array(ISIZE * ISIZE);
 
-    function queueSettingUpdate(key, value) {
-      pendingSettings[key] = value;
-      if (pendingTimeout) return;
-      pendingTimeout = setTimeout(() => {
-        fetch('/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(pendingSettings) }).catch(console.error);
-        pendingSettings = {}; pendingTimeout = null;
+    let pending = {}, pendingTimer = null, lastRx = 0;
+
+    function queue(key, val) {
+      pending[key] = val;
+      if (pendingTimer) return;
+      pendingTimer = setTimeout(() => {
+        fetch('/settings', { method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify(pending) }).catch(console.error);
+        pending = {}; pendingTimer = null;
       }, 150);
     }
 
-    function bindNumberInput(element, key, { min=-Infinity, max=Infinity, decimals=2 }={}) {
-      element.addEventListener('change', () => {
-        let value = parseFloat(element.value);
-        if (Number.isNaN(value)) return;
-        if (value < min) value = min; if (value > max) value = max;
-        element.value = value.toFixed(decimals);
-        queueSettingUpdate(key, value);
-      });
+    function bindSlider(id, valId, key, fmt) {
+      const sl = document.getElementById(id);
+      const vl = document.getElementById(valId);
+      sl.addEventListener('input', () => { vl.textContent = fmt(sl.value); queue(key, parseFloat(sl.value)); });
+      return sl;
+    }
+
+    const slMin = bindSlider('sliderMin','sliderMinValue','manualMin', v=>Number(v).toFixed(1));
+    const slMax = bindSlider('sliderMax','sliderMaxValue','manualMax', v=>Number(v).toFixed(1));
+    const slKp  = bindSlider('kp','kpVal','kp', v=>Number(v).toFixed(0));
+    const slKi  = bindSlider('ki','kiVal','ki', v=>Number(v).toFixed(1));
+    const slKd  = bindSlider('kd','kdVal','kd', v=>Number(v).toFixed(0));
+
+    document.getElementById('toggleManual').addEventListener('change', e => {
+      queue('useManualRange', e.target.checked);
+      slMin.disabled = slMax.disabled = !e.target.checked;
+    });
+    document.getElementById('toggleInterp').addEventListener('change', e =>
+      queue('useInterpolation', e.target.checked));
+
+    function applySettings(d) {
+      const tm = document.getElementById('toggleManual');
+      const ti = document.getElementById('toggleInterp');
+      if (document.activeElement !== slMin) slMin.value = d.manualMin.toFixed(1);
+      if (document.activeElement !== slMax) slMax.value = d.manualMax.toFixed(1);
+      document.getElementById('sliderMinValue').textContent = Number(slMin.value).toFixed(1);
+      document.getElementById('sliderMaxValue').textContent = Number(slMax.value).toFixed(1);
+      slMin.disabled = slMax.disabled = !d.useManualRange;
+      tm.checked = d.useManualRange;
+      ti.checked = d.useInterpolation;
+      if (document.activeElement !== slKp) { slKp.value = d.kp; document.getElementById('kpVal').textContent = d.kp.toFixed(0); }
+      if (document.activeElement !== slKi) { slKi.value = d.ki; document.getElementById('kiVal').textContent = d.ki.toFixed(1); }
+      if (document.activeElement !== slKd) { slKd.value = d.kd; document.getElementById('kdVal').textContent = d.kd.toFixed(0); }
+    }
+
+    function thermalColor(r) {
+      r = Math.max(0, Math.min(1, r));
+      let R=0,G=0,B=0;
+      if      (r<=.25) { const f=r/.25;      G=Math.round(255*f); B=255; }
+      else if (r<=.50) { const f=(r-.25)/.25; G=255; B=Math.round(255*(1-f)); }
+      else if (r<=.75) { const f=(r-.50)/.25; R=Math.round(255*f); G=255; }
+      else             { const f=(r-.75)/.25; R=255; G=Math.round(255*(1-f)); }
+      return `rgb(${R},${G},${B})`;
+    }
+
+    function bilinear(src, dst) {
+      for (let y=0; y<ISIZE; y++) {
+        const gy=y/UP, y0=Math.floor(gy), y1=Math.min(y0+1,GRID-1), fy=gy-y0;
+        for (let x=0; x<ISIZE; x++) {
+          const gx=x/UP, x0=Math.floor(gx), x1=Math.min(x0+1,GRID-1), fx=gx-x0;
+          const v00=src[y0*GRID+x0], v01=src[y0*GRID+x1],
+                v10=src[y1*GRID+x0], v11=src[y1*GRID+x1];
+          dst[y*ISIZE+x] = (v00+fx*(v01-v00)) + fy*((v10+fx*(v11-v10))-(v00+fx*(v01-v00)));
+        }
+      }
+    }
+
+    function drawHeatmap(pixels, minT, maxT, interp) {
+      const rng = (maxT - minT) || 1;
+      ctx.clearRect(0, 0, 320, 320);
+      if (interp) {
+        bilinear(pixels, interpBuf);
+        const cw = 320/ISIZE, ch = 320/ISIZE;
+        for (let y=0; y<ISIZE; y++) for (let x=0; x<ISIZE; x++) {
+          ctx.fillStyle = thermalColor(Math.pow((interpBuf[y*ISIZE+x]-minT)/rng, 0.6));
+          ctx.fillRect(x*cw, y*ch, cw, ch);
+        }
+      } else {
+        const cw = 320/GRID, ch = 320/GRID;
+        for (let y=0; y<GRID; y++) for (let x=0; x<GRID; x++) {
+          ctx.fillStyle = thermalColor(Math.pow((pixels[y*GRID+x]-minT)/rng, 0.6));
+          ctx.fillRect(x*cw, y*ch, cw, ch);
+        }
+      }
+    }
+
+    // Crosshair + scan arc indicator
+    function drawOverlay(d) {
+      octx.clearRect(0, 0, 320, 320);
+      const cw = 320/GRID, ch = 320/GRID;
+
+      if (d.trackerState === 'SCAN') {
+        // Animate a sweeping arc to indicate scan
+        const sweepX = (d.scanPulse - 500) / (2500 - 500);  // 0..1
+        const sx = sweepX * 320;
+        octx.strokeStyle = 'rgba(160,128,255,0.7)';
+        octx.lineWidth = 2;
+        octx.setLineDash([6, 4]);
+        octx.beginPath(); octx.moveTo(sx, 0); octx.lineTo(sx, 320); octx.stroke();
+        octx.setLineDash([]);
+        return;
+      }
+
+      if (!d.targetFound) return;
+
+      const cx = (d.targetX + 0.5) * cw;
+      const cy = (d.targetY + 0.5) * ch;
+      const r  = cw * 0.85;
+      const color = d.trackerState === 'HOLD'
+                  ? 'rgba(255,200,0,0.85)'
+                  : 'rgba(0,255,128,0.9)';
+      octx.strokeStyle = color;
+      octx.lineWidth = 2;
+      octx.beginPath(); octx.arc(cx, cy, r, 0, 2*Math.PI); octx.stroke();
+      octx.beginPath(); octx.moveTo(cx-r*1.6, cy); octx.lineTo(cx+r*1.6, cy); octx.stroke();
+      octx.beginPath(); octx.moveTo(cx, cy-r*1.6); octx.lineTo(cx, cy+r*1.6); octx.stroke();
     }
 
     function updateFrameAge() {
-      if (!lastFrameReceived) { lastFrame.textContent = '--'; return; }
-      const seconds = (Date.now() - lastFrameReceived) / 1000;
-      lastFrame.textContent = seconds < 0.5 ? 'just now' : `${seconds.toFixed(1)} s ago`;
+      if (!lastRx) { document.getElementById('last-frame').textContent='--'; return; }
+      const s = (Date.now()-lastRx)/1000;
+      document.getElementById('last-frame').textContent = s<0.5 ? 'just now' : `${s.toFixed(1)}s ago`;
     }
 
-    function thermalColor(ratio) {
-      ratio = Math.max(0, Math.min(1, ratio));
-      let r=0,g=0,b=0;
-      if (ratio <= 0.25) { const f = ratio/0.25; g = Math.round(255*f); b=255; }
-      else if (ratio <= 0.5) { const f=(ratio-0.25)/0.25; g=255; b=Math.round(255*(1-f)); }
-      else if (ratio <= 0.75) { const f=(ratio-0.5)/0.25; r=Math.round(255*f); g=255; }
-      else { const f=(ratio-0.75)/0.25; r=255; g=Math.round(255*(1-f)); }
-      return `rgb(${r},${g},${b})`;
-    }
-
-    function bilinearInterpolate(src, srcW, srcH, scale, dst) {
-      const dstW = srcW * scale, dstH = srcH * scale;
-      for (let y=0; y<dstH; y++) {
-        const gy = y/scale; const y0=Math.floor(gy), y1=Math.min(y0+1, srcH-1); const fy=gy-y0;
-        for (let x=0; x<dstW; x++) {
-          const gx = x/scale; const x0=Math.floor(gx), x1=Math.min(x0+1, srcW-1); const fx=gx-x0;
-          const v00=src[y0*srcW+x0], v01=src[y0*srcW+x1], v10=src[y1*srcW+x0], v11=src[y1*srcW+x1];
-          const v0=v00+fx*(v01-v00), v1=v10+fx*(v11-v10); dst[y*dstW+x]=v0+fy*(v1-v0);
-        }
-      }
-      return dst;
-    }
-
-    function drawHeatmap(pixels, minT, maxT, useInterp) {
-      const safeRange = (maxT - minT) || 1;
-      ctx.clearRect(0, 0, heatmap.width, heatmap.height);
-      if (useInterp) {
-        const interp = bilinearInterpolate(pixels, GRID_SIZE, GRID_SIZE, UPSCALE, interpBuffer);
-        const cellW = heatmap.width / INTERP_SIZE, cellH = heatmap.height / INTERP_SIZE;
-        for (let y=0; y<INTERP_SIZE; y++) {
-          for (let x=0; x<INTERP_SIZE; x++) {
-            const temp = interp[y*INTERP_SIZE+x];
-            const ratio = Math.pow((temp - minT) / safeRange, 0.6);
-            ctx.fillStyle = thermalColor(ratio);
-            ctx.fillRect(x*cellW, y*cellH, cellW, cellH);
-          }
-        }
-      } else {
-        const cellW = heatmap.width / GRID_SIZE, cellH = heatmap.height / GRID_SIZE;
-        for (let y=0; y<GRID_SIZE; y++) {
-          for (let x=0; x<GRID_SIZE; x++) {
-            const temp = pixels[y*GRID_SIZE+x];
-            const ratio = Math.pow((temp - minT) / safeRange, 0.6);
-            ctx.fillStyle = thermalColor(ratio);
-            ctx.fillRect(x*cellW, y*cellH, cellW, cellH);
-          }
-        }
-      }
-    }
-
-    function updateControls(data) {
-      if (document.activeElement !== sliderMin) sliderMin.value = data.manualMin.toFixed(1);
-      if (document.activeElement !== sliderMax) sliderMax.value = data.manualMax.toFixed(1);
-      sliderMinValue.textContent = Number(sliderMin.value).toFixed(1);
-      sliderMaxValue.textContent = Number(sliderMax.value).toFixed(1);
-      sliderMin.disabled = sliderMax.disabled = !data.useManualRange;
-      toggleManual.checked = data.useManualRange;
-      toggleInterp.checked = data.useInterpolation;
-      updatePIDControls(data);
-  // Auto-range tuning values are not exposed in the web UI.
-    }
+    const stateEl = document.getElementById('tracker-state');
+    const stateClass = { TRACK:'state-track', HOLD:'state-hold', SCAN:'state-scan' };
 
     function fetchFrame() {
-      fetch('/frame').then(r => r.json()).then(data => {
-        updateControls(data);
-        if (data.ip) ipAddress.textContent = data.ip;
-        if (!data.frameReady) return;
-        drawHeatmap(data.pixels, data.tMin, data.tMax, data.useInterpolation);
-        statMin.textContent = `${data.tMin.toFixed(1)} C`;
-        statMax.textContent = `${data.tMax.toFixed(1)} C`;
-        statMedian.textContent = `${data.median.toFixed(1)} C`;
-        lastFrameReceived = Date.now();
+      fetch('/frame').then(r=>r.json()).then(d => {
+        applySettings(d);
+        if (d.ip) document.getElementById('ip-address').textContent = d.ip;
+        if (!d.frameReady) return;
+        drawHeatmap(d.pixels, d.tMin, d.tMax, d.useInterpolation);
+        drawOverlay(d);
+        document.getElementById('stat-min').textContent    = `${d.tMin.toFixed(1)}°`;
+        document.getElementById('stat-max').textContent    = `${d.tMax.toFixed(1)}°`;
+        document.getElementById('stat-median').textContent = `${d.median.toFixed(1)}°`;
+        document.getElementById('target-pos').textContent  =
+          d.targetFound ? `(${d.targetX.toFixed(1)}, ${d.targetY.toFixed(1)})` : 'none';
+        stateEl.textContent = d.trackerState || 'SCAN';
+        stateEl.className = 'state-badge ' + (stateClass[d.trackerState] || 'state-scan');
+        lastRx = Date.now();
         updateFrameAge();
-      }).catch(err => { console.error(err); lastFrameReceived = 0; lastFrame.textContent = 'disconnected'; });
+      }).catch(e => {
+        console.error(e);
+        lastRx = 0;
+        document.getElementById('last-frame').textContent = 'disconnected';
+      });
     }
 
-    toggleManual.addEventListener('change', () => { queueSettingUpdate('useManualRange', toggleManual.checked); sliderMin.disabled = sliderMax.disabled = !toggleManual.checked; });
-    toggleInterp.addEventListener('change', () => { queueSettingUpdate('useInterpolation', toggleInterp.checked); });
-  // Auto-range tuning bindings removed.
-    sliderMin.addEventListener('input', () => { const v=Number(sliderMin.value); sliderMinValue.textContent = v.toFixed(1); queueSettingUpdate('manualMin', v); });
-    sliderMax.addEventListener('input', () => { const v=Number(sliderMax.value); sliderMaxValue.textContent = v.toFixed(1); queueSettingUpdate('manualMax', v); });
-
-    (function init(){ fetch('/settings').then(r=>r.json()).then(updateControls).catch(console.error); fetchFrame(); setInterval(fetchFrame, 400); setInterval(updateFrameAge, 250); })();
+    fetch('/settings').then(r=>r.json()).then(applySettings).catch(console.error);
+    fetchFrame();
+    setInterval(fetchFrame, 400);
+    setInterval(updateFrameAge, 250);
   </script>
 </body>
 </html>
 )rawliteral";
 
+// ─────────────────────────────────────────────
+// Tracker state machine
+// ─────────────────────────────────────────────
+enum TrackerState { TS_SCAN = 0, TS_HOLD, TS_TRACK };
+static TrackerState trackerState  = TS_SCAN;
+static float        trackTargetX  = GRID_W / 2.0f;
+static float        trackTargetY  = GRID_H / 2.0f;
+static bool         trackFound    = false;
+static int          trackLostFrames = 0;
+
+// ─────────────────────────────────────────────
 // JSON helpers
+// ─────────────────────────────────────────────
 static void sendJson(const JsonDocument &doc) {
-  String payload; serializeJson(doc, payload); server.send(200, "application/json", payload);
+  String p; serializeJson(doc, p); server.send(200, "application/json", p);
 }
-
-static void sendJsonError(int code, const char *message) {
-  StaticJsonDocument<128> doc; doc["error"] = message; String payload; serializeJson(doc, payload); server.send(code, "application/json", payload);
+static void sendJsonError(int code, const char *msg) {
+  StaticJsonDocument<128> doc; doc["error"] = msg;
+  String p; serializeJson(doc, p); server.send(code, "application/json", p);
 }
-
 static void handleIndex() { server.send_P(200, "text/html", INDEX_HTML); }
+
+static const char *trackerStateName() {
+  switch (trackerState) {
+    case TS_TRACK: return "TRACK";
+    case TS_HOLD:  return "HOLD";
+    default:       return "SCAN";
+  }
+}
 
 static void handleFrame() {
   StaticJsonDocument<4096> doc;
-  doc["frameReady"] = frameAvailable;
-  doc["ip"] = deviceIp;
+  doc["frameReady"]       = frameAvailable;
+  doc["ip"]               = deviceIp;
   doc["useInterpolation"] = useInterpolation;
-  doc["useManualRange"] = useManualRange;
-  doc["manualMin"] = manualMin;
-  doc["manualMax"] = manualMax;
-  doc["kp"] = kp;
-  doc["ki"] = ki;
-  doc["kd"] = kd;
+  doc["useManualRange"]   = useManualRange;
+  doc["manualMin"]        = manualMin;
+  doc["manualMax"]        = manualMax;
+  doc["kp"]  = kp;
+  doc["ki"]  = ki;
+  doc["kd"]  = kd;
+  doc["targetFound"]   = trackFound;
+  doc["targetX"]       = trackTargetX;
+  doc["targetY"]       = trackTargetY;
+  doc["trackerState"]  = trackerStateName();
+  doc["scanPulse"]     = currentPulse;
   if (frameAvailable) {
     doc["timestamp"] = latestFrameMillis;
-    doc["tMin"] = latestFrameMin;
-    doc["tMax"] = latestFrameMax;
-    doc["median"] = latestFrameMedian;
+    doc["tMin"]      = latestFrameMin;
+    doc["tMax"]      = latestFrameMax;
+    doc["median"]    = latestFrameMedian;
     JsonArray arr = doc.createNestedArray("pixels");
     for (int i = 0; i < AMG88xx_PIXEL_ARRAY_SIZE; i++) arr.add(latestFrame[i]);
   } else {
     doc["timestamp"] = 0;
-    doc["tMin"] = manualMin;
-    doc["tMax"] = manualMax;
-    doc["median"] = 0;
+    doc["tMin"]   = manualMin; doc["tMax"] = manualMax; doc["median"] = 0;
     doc.createNestedArray("pixels");
   }
   sendJson(doc);
 }
+
 static void handleSettingsGet() {
   StaticJsonDocument<256> doc;
-  doc["manualMin"] = manualMin;
-  doc["manualMax"] = manualMax;
-  doc["useManualRange"] = useManualRange;
+  doc["manualMin"]        = manualMin;
+  doc["manualMax"]        = manualMax;
+  doc["useManualRange"]   = useManualRange;
   doc["useInterpolation"] = useInterpolation;
-  doc["kp"] = kp;
-  doc["ki"] = ki;
-  doc["kd"] = kd;
-  doc["ip"] = deviceIp;
+  doc["kp"]  = kp;
+  doc["ki"]  = ki;
+  doc["kd"]  = kd;
+  doc["ip"]  = deviceIp;
   sendJson(doc);
 }
 
 static void handleSettingsPost() {
   if (!server.hasArg("plain")) { sendJsonError(400, "Missing body"); return; }
-  StaticJsonDocument<512> doc; DeserializationError err = deserializeJson(doc, server.arg("plain"));
-  if (err) { sendJsonError(400, "Invalid JSON"); return; }
-
-  if (doc.containsKey("manualMin")) manualMin = doc["manualMin"].as<float>();
-  if (doc.containsKey("manualMax")) manualMax = doc["manualMax"].as<float>();
-  if (doc.containsKey("useManualRange")) useManualRange = doc["useManualRange"].as<bool>();
+  StaticJsonDocument<512> doc;
+  if (deserializeJson(doc, server.arg("plain"))) { sendJsonError(400, "Invalid JSON"); return; }
+  if (doc.containsKey("manualMin"))        manualMin        = doc["manualMin"].as<float>();
+  if (doc.containsKey("manualMax"))        manualMax        = doc["manualMax"].as<float>();
+  if (doc.containsKey("useManualRange"))   useManualRange   = doc["useManualRange"].as<bool>();
   if (doc.containsKey("useInterpolation")) useInterpolation = doc["useInterpolation"].as<bool>();
-
   if (doc.containsKey("kp")) kp = doc["kp"].as<float>();
   if (doc.containsKey("ki")) ki = doc["ki"].as<float>();
   if (doc.containsKey("kd")) kd = doc["kd"].as<float>();
-
   handleSettingsGet();
 }
 
 static void handleNotFound() {
-  // Redirect unknown requests to root to trigger captive portal behavior on clients
   server.sendHeader("Location", "/");
   server.send(302, "text/plain", "Redirecting to captive portal");
 }
 
-// Power control
+// ─────────────────────────────────────────────
+// Power
+// ─────────────────────────────────────────────
 static void powerOff() {
   tft.writecommand(ST7789_DISPOFF);
   tft.writecommand(ST7789_SLPIN);
   esp_deep_sleep_start();
 }
 
+// ─────────────────────────────────────────────
 // Color mapping
-static float gammaAdjust(float ratio, float gamma) {
-  if (ratio < 0) ratio = 0; if (ratio > 1) ratio = 1; return powf(ratio, gamma);
-}
+// ─────────────────────────────────────────────
 static uint16_t thermalGradient(float ratio) {
-  if (ratio < 0) ratio = 0; if (ratio > 1) ratio = 1;
+  ratio = constrain(ratio, 0.0f, 1.0f);
   uint8_t r=0,g=0,b=0;
-  if (ratio <= 0.25f) { float f = ratio/0.25f; g = (uint8_t)(255*f); b=255; }
-  else if (ratio <= 0.50f) { float f=(ratio-0.25f)/0.25f; g=255; b=(uint8_t)(255*(1-f)); }
-  else if (ratio <= 0.75f) { float f=(ratio-0.50f)/0.25f; r=(uint8_t)(255*f); g=255; }
-  else { float f=(ratio-0.75f)/0.25f; r=255; g=(uint8_t)(255*(1-f)); }
+  if      (ratio<=.25f){float f=ratio/.25f;        g=(uint8_t)(255*f); b=255;}
+  else if (ratio<=.50f){float f=(ratio-.25f)/.25f; g=255; b=(uint8_t)(255*(1-f));}
+  else if (ratio<=.75f){float f=(ratio-.50f)/.25f; r=(uint8_t)(255*f); g=255;}
+  else                 {float f=(ratio-.75f)/.25f; r=255; g=(uint8_t)(255*(1-f));}
   return tft.color565(r,g,b);
 }
-static uint16_t tempToColor(float temp, float tMin, float tMax) {
-  float ratio = (temp - tMin) / (tMax - tMin);
-  ratio = gammaAdjust(ratio, 0.6f);
 
+static uint16_t tempToColor(float temp, float tMin, float tMax, float ambient) {
+  float ratio = powf(constrain((temp-tMin)/(tMax-tMin),0.f,1.f), 0.6f);
   if (displayMode == MODE_PERSON) {
-    if (temp >= HUMAN_TEMP_MIN && temp <= HUMAN_TEMP_MAX) {
-      return TFT_WHITE;
-    } else {
-      uint8_t v = (uint8_t)(30 * ratio);
-      return tft.color565(0, 0, v);
-    }
-  } else if (displayMode == MODE_GRAYSCALE) {
-    uint8_t v = (uint8_t)(255 * ratio);
-    return tft.color565(v, v, v);
-  } else {
-    return thermalGradient(ratio);
+    float lo = ambient + HUMAN_ABOVE_MIN, hi = ambient + HUMAN_ABOVE_MAX;
+    if (temp >= lo && temp <= hi) return TFT_WHITE;
+    return tft.color565(0, 0, (uint8_t)(30*ratio));
   }
+  if (displayMode == MODE_GRAYSCALE) {
+    uint8_t v = (uint8_t)(255*ratio);
+    return tft.color565(v,v,v);
+  }
+  return thermalGradient(ratio);
 }
 
+// ─────────────────────────────────────────────
 // Buttons
-bool lastInterpState = HIGH; unsigned long interpPressStart = 0;
-bool lastRangeState = HIGH;  unsigned long lastRangeToggle = 0;
-
-static bool motorEnabled = true;  // new global toggle state
+// ─────────────────────────────────────────────
+bool lastInterpState = HIGH;
+bool lastRangeState  = HIGH;
+unsigned long lastRangeToggle = 0;
+static bool motorEnabled = true;
 
 static void checkButtons() {
-  int interpReading = digitalRead(BUTTON_INTERP);
-  int rangeReading  = digitalRead(BUTTON_RANGE);
+  int iR = digitalRead(BUTTON_INTERP);
+  int rR = digitalRead(BUTTON_RANGE);
 
-  // --- Interp button: short press toggles grayscale, long press toggles motor enable ---
-  static unsigned long interpPressStart = 0;
-  if (interpReading == LOW && lastInterpState == HIGH) interpPressStart = millis();
-  if (interpReading == HIGH && lastInterpState == LOW) {
-    unsigned long pressDuration = millis() - interpPressStart;
-    if (pressDuration < 800) {
-      displayMode = (DisplayMode)((displayMode + 1) % 3);  // cycle modes
-    } else {
-      motorEnabled = !motorEnabled;  // long press toggles motor enable
-      if (!motorEnabled) {
-        servo.writeMicroseconds(1500); // stop motor immediately
-      }
+  static unsigned long iPress = 0;
+  if (iR==LOW && lastInterpState==HIGH) iPress = millis();
+  if (iR==HIGH && lastInterpState==LOW) {
+    unsigned long dur = millis()-iPress;
+    if (dur < 800) displayMode = (DisplayMode)((displayMode+1)%3);
+    else { motorEnabled = !motorEnabled; if (!motorEnabled) servo.writeMicroseconds(1500); }
+  }
+  lastInterpState = iR;
+
+  static unsigned long rPress = 0;
+  if (rR==LOW && lastRangeState==HIGH) rPress = millis();
+  if (rR==HIGH && lastRangeState==LOW) {
+    if (millis()-rPress < 2000 && millis()-lastRangeToggle > 250) {
+      useManualRange = !useManualRange;
+      lastRangeToggle = millis();
+      autoRangeInitialized = false;
     }
   }
-  lastInterpState = interpReading;
-
-  // --- Range button: long press powers off, short press toggles range ---
-  static unsigned long rangePressStart = 0;
-  if (rangeReading == LOW && lastRangeState == HIGH) rangePressStart = millis();
-  if (rangeReading == HIGH && lastRangeState == LOW) {
-    unsigned long pressDuration = millis() - rangePressStart;
-    if (pressDuration < 2000) {
-      if (millis() - lastRangeToggle > 250) {
-        useManualRange = !useManualRange;
-        lastRangeToggle = millis();
-        autoRangeInitialized = false;
-      }
-    }
-  }
-  if (rangeReading == LOW && millis() - rangePressStart > 2000) {
-    powerOff();
-  }
-  lastRangeState = rangeReading;
+  if (rR==LOW && millis()-rPress > 2000) powerOff();
+  lastRangeState = rR;
 }
 
-
-// Stats and filtering
+// ─────────────────────────────────────────────
+// Stats / filtering
+// ─────────────────────────────────────────────
 static float computeMedian(float *arr, int n) {
-  float temp[AMG88xx_PIXEL_ARRAY_SIZE];
-  memcpy(temp, arr, n * sizeof(float));
-  std::sort(temp, temp + n);
-  if (n % 2 == 0) return 0.5f * (temp[n/2 - 1] + temp[n/2]);
-  return temp[n/2];
+  float tmp[AMG88xx_PIXEL_ARRAY_SIZE];
+  memcpy(tmp, arr, n*sizeof(float));
+  std::sort(tmp, tmp+n);
+  return (n%2==0) ? 0.5f*(tmp[n/2-1]+tmp[n/2]) : tmp[n/2];
 }
 
 static void drawModeIndicator() {
-  const char *label;
-  uint16_t color;
-  switch (displayMode) {
-    case MODE_GRAYSCALE: label = "GRAY";   color = TFT_WHITE;  break;
-    case MODE_PERSON:    label = "PERSON"; color = TFT_GREEN;  break;
-    default:             label = "THERMAL"; color = TFT_CYAN;  break;
+  const char *lbl; uint16_t col;
+  switch(displayMode){
+    case MODE_GRAYSCALE: lbl="GRAY";    col=TFT_WHITE; break;
+    case MODE_PERSON:    lbl="PERSON";  col=TFT_GREEN; break;
+    default:             lbl="THERMAL"; col=TFT_CYAN;  break;
   }
-  tft.setTextColor(color, TFT_BLACK);
-  tft.drawString(label, 6, 6, 2);
+  tft.setTextColor(col, TFT_BLACK);
+  tft.drawString(lbl, 6, 6, 2);
 }
 
 static void drawTempStats(float tMin, float tMax, float median) {
   char buf[32];
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
-
-  // Bottom row
-  int y = tft.height() - 20;
-  int x = 5;
-
-  // Min
-  snprintf(buf, sizeof(buf), "Min: %.1fC", tMin);
-  tft.drawString(buf, x, y, 2);
-  x += tft.textWidth(buf, 2) + 10;
-
-  // Median
-  snprintf(buf, sizeof(buf), "Med: %.1fC", median);
-  tft.drawString(buf, x, y, 2);
-  x += tft.textWidth(buf, 2) + 10;
-
-  // Max
-  snprintf(buf, sizeof(buf), "Max: %.1fC", tMax);
-  tft.drawString(buf, x, y, 2);
+  int y=tft.height()-20, x=5;
+  snprintf(buf,sizeof(buf),"Min:%.1f",tMin); tft.drawString(buf,x,y,2); x+=tft.textWidth(buf,2)+8;
+  snprintf(buf,sizeof(buf),"Med:%.1f",median); tft.drawString(buf,x,y,2); x+=tft.textWidth(buf,2)+8;
+  snprintf(buf,sizeof(buf),"Max:%.1f",tMax); tft.drawString(buf,x,y,2);
 }
 
 static float suppressAmbientNoise(float value, float ambient) {
-  float diff = value - ambient;
-  if (diff > ambientDeadband) return ambient + (diff - ambientDeadband);
-  if (diff < -ambientDeadband) return ambient + (diff + ambientDeadband);
+  float d = value - ambient;
+  if (d >  ambientDeadband) return ambient + (d - ambientDeadband);
+  if (d < -ambientDeadband) return ambient + (d + ambientDeadband);
   return ambient;
 }
 
-static void computeDisplayRange(const float *data, int count, float *outMin, float *outMax) {
-  if (count <= 0) { *outMin = 0.0f; *outMax = 1.0f; return; }
-  float minVal = data[0], maxVal = data[0];
-  for (int i = 1; i < count; i++) { if (data[i] < minVal) minVal = data[i]; if (data[i] > maxVal) maxVal = data[i]; }
-  if (maxVal - minVal < minAutoRange) {
-    float mid = 0.5f * (maxVal + minVal);
-    minVal = mid - minAutoRange * 0.5f; maxVal = mid + minAutoRange * 0.5f;
-  }
-  *outMin = minVal - autoRangePad; *outMax = maxVal + autoRangePad;
+static void computeDisplayRange(const float *data, int n, float *oMin, float *oMax) {
+  float mn=data[0], mx=data[0];
+  for (int i=1;i<n;i++){if(data[i]<mn)mn=data[i];if(data[i]>mx)mx=data[i];}
+  if (mx-mn < minAutoRange){float mid=0.5f*(mx+mn); mn=mid-minAutoRange*0.5f; mx=mid+minAutoRange*0.5f;}
+  *oMin = mn - autoRangePad; *oMax = mx + autoRangePad;
 }
 
-static void applyRangeSmoothing(float targetMin, float targetMax, float *outMin, float *outMax) {
-  if (!autoRangeInitialized) { smoothRangeMin = targetMin; smoothRangeMax = targetMax; autoRangeInitialized = true; }
+static void applyRangeSmoothing(float tgMin, float tgMax, float *oMin, float *oMax) {
+  if (!autoRangeInitialized){smoothRangeMin=tgMin;smoothRangeMax=tgMax;autoRangeInitialized=true;}
   else {
-    float expandMinRate = (targetMin < smoothRangeMin) ? rangeExpandRate : rangeContractRate;
-    float expandMaxRate = (targetMax > smoothRangeMax) ? rangeExpandRate : rangeContractRate;
-    smoothRangeMin += (targetMin - smoothRangeMin) * expandMinRate;
-    smoothRangeMax += (targetMax - smoothRangeMax) * expandMaxRate;
-    if (smoothRangeMax - smoothRangeMin < minAutoRange) {
-      float mid = 0.5f * (smoothRangeMin + smoothRangeMax);
-      smoothRangeMin = mid - minAutoRange * 0.5f; smoothRangeMax = mid + minAutoRange * 0.5f;
+    smoothRangeMin += (tgMin-smoothRangeMin)*((tgMin<smoothRangeMin)?rangeExpandRate:rangeContractRate);
+    smoothRangeMax += (tgMax-smoothRangeMax)*((tgMax>smoothRangeMax)?rangeExpandRate:rangeContractRate);
+    if (smoothRangeMax-smoothRangeMin < minAutoRange){
+      float mid=0.5f*(smoothRangeMin+smoothRangeMax);
+      smoothRangeMin=mid-minAutoRange*0.5f; smoothRangeMax=mid+minAutoRange*0.5f;
     }
   }
-  *outMin = smoothRangeMin; *outMax = smoothRangeMax;
+  *oMin=smoothRangeMin; *oMax=smoothRangeMax;
 }
 
+// ─────────────────────────────────────────────
 // Drawing
-static void drawInterpolatedHeatmap(const float *pix, float tMin, float tMax) {
-  int W = tft.width(), H = tft.height();
-  int cellW = (W + INTERP_W - 1) / INTERP_W;
-  int cellH = (H + INTERP_H - 1) / INTERP_H;
-  int gridWpx = cellW * INTERP_W, gridHpx = cellH * INTERP_H;
-  int x0 = (W - gridWpx) / 2, y0 = (H - gridHpx) / 2;
-  tft.startWrite();
-  for (int y = 0; y < INTERP_H; y++) {
-    for (int x = 0; x < INTERP_W; x++) {
-      int i = y * INTERP_W + x; uint16_t c = tempToColor(pix[i], tMin, tMax);
-      tft.fillRect(x0 + x * cellW, y0 + y * cellH, cellW, cellH, c);
+// ─────────────────────────────────────────────
+static void bilinearInterpolate(const float *src, float *dst, int sW, int sH, int scale) {
+  int dW=sW*scale, dH=sH*scale;
+  for(int y=0;y<dH;y++){
+    float gy=(float)y/scale; int y0=(int)floorf(gy),y1=(y0+1<sH)?y0+1:sH-1; float fy=gy-y0;
+    for(int x=0;x<dW;x++){
+      float gx=(float)x/scale; int x0=(int)floorf(gx),x1=(x0+1<sW)?x0+1:sW-1; float fx=gx-x0;
+      float v0=src[y0*sW+x0]+fx*(src[y0*sW+x1]-src[y0*sW+x0]);
+      float v1=src[y1*sW+x0]+fx*(src[y1*sW+x1]-src[y1*sW+x0]);
+      dst[y*dW+x]=v0+fy*(v1-v0);
     }
+  }
+}
+
+static void drawHeatmapTFT(const float *pix, float tMin, float tMax, float ambient,
+                            int gW, int gH) {
+  int W=tft.width(), H=tft.height();
+  int cW=(W+gW-1)/gW, cH=(H+gH-1)/gH;
+  int x0=(W-cW*gW)/2, y0=(H-cH*gH)/2;
+  tft.startWrite();
+  for(int y=0;y<gH;y++) for(int x=0;x<gW;x++){
+    tft.fillRect(x0+x*cW, y0+y*cH, cW, cH,
+                 tempToColor(pix[y*gW+x], tMin, tMax, ambient));
   }
   tft.endWrite();
 }
 
-static void bilinearInterpolate(const float *src, float *dst, int srcW, int srcH, int scale) {
-  int dstW = srcW * scale, dstH = srcH * scale;
-  for (int y = 0; y < dstH; y++) {
-    float gy = (float)y / (float)scale; int y0 = (int)floorf(gy); int y1 = (y0 + 1 < srcH) ? y0 + 1 : srcH - 1; float fy = gy - (float)y0;
-    for (int x = 0; x < dstW; x++) {
-      float gx = (float)x / (float)scale; int x0 = (int)floorf(gx); int x1 = (x0 + 1 < srcW) ? x0 + 1 : srcW - 1; float fx = gx - (float)x0;
-      float v00 = src[y0 * srcW + x0], v01 = src[y0 * srcW + x1], v10 = src[y1 * srcW + x0], v11 = src[y1 * srcW + x1];
-      float v0 = v00 + fx * (v01 - v00), v1 = v10 + fx * (v11 - v10);
-      dst[y * dstW + x] = v0 + fy * (v1 - v0);
-    }
-  }
-}
-
-static void drawHeatmap(const float *pix, float tMin, float tMax) {
-  int W = tft.width(), H = tft.height();
-  int cellW = (W + GRID_W - 1) / GRID_W;
-  int cellH = (H + GRID_H - 1) / GRID_H;
-  int gridWpx = cellW * GRID_W, gridHpx = cellH * GRID_H;
-  int x0 = (W - gridWpx) / 2, y0 = (H - gridHpx) / 2;
-  tft.startWrite();
-  for (int y = 0; y < GRID_H; y++) {
-    for (int x = 0; x < GRID_W; x++) {
-      int i = y * GRID_W + x; uint16_t c = tempToColor(pix[i], tMin, tMax);
-      tft.fillRect(x0 + x * cellW, y0 + y * cellH, cellW, cellH, c);
-    }
-  }
-  tft.endWrite();
-}
-
-static void trackHottestPixel(const float *pixels) {
-  if (!motorEnabled) {
-    servo.writeMicroseconds(1500);
+static void drawTrackingIndicator() {
+  if (trackerState == TS_SCAN) {
+    // Show a vertical dashed sweep line
+    int W=tft.width(), H=tft.height();
+    float frac = (float)(currentPulse - SCAN_MIN_PULSE) / (SCAN_MAX_PULSE - SCAN_MIN_PULSE);
+    int sx = (int)(frac * W);
+    for (int y=4; y<H-20; y+=6) tft.drawPixel(sx, y, TFT_MAGENTA);
     return;
   }
-  static float integral = 0.0f;
-  static int lastPulse = 1500;
-  static float lastOffset = 0.0f;
+  if (!trackFound) return;
+  int W=tft.width(), H=tft.height();
+  int cW=(W+GRID_W-1)/GRID_W, cH=(H+GRID_H-1)/GRID_H;
+  int x0=(W-cW*GRID_W)/2, y0=(H-cH*GRID_H)/2;
+  int cx=x0+(int)(trackTargetX*cW)+cW/2;
+  int cy=y0+(int)(trackTargetY*cH)+cH/2;
+  int r=cW;
+  uint16_t col = (trackerState==TS_HOLD) ? TFT_YELLOW : TFT_GREEN;
+  tft.drawCircle(cx,cy,r,col);
+  tft.drawFastHLine(cx-r*2,cy,r*4,col);
+  tft.drawFastVLine(cx,cy-r*2,r*4,col);
+}
 
-  float targetX;
+// ─────────────────────────────────────────────
+// Servo control
+// ─────────────────────────────────────────────
 
-  if (displayMode == MODE_PERSON) {
-    float sumX = 0, sumWeight = 0;
-    for (int i = 0; i < AMG88xx_PIXEL_ARRAY_SIZE; i++) {
-      if (pixels[i] >= HUMAN_TEMP_MIN && pixels[i] <= HUMAN_TEMP_MAX) {
-        sumX += (i % GRID_W);
-        sumWeight += 1.0f;
-      }
-    }
-    if (sumWeight == 0) {
-      servo.writeMicroseconds(1500);
-      integral = 0;
-      return;
-    }
-    targetX = sumX / sumWeight;
-  } else {
-    int hottestIndex = 0;
-    float maxTemp = pixels[0];
-    for (int i = 1; i < AMG88xx_PIXEL_ARRAY_SIZE; i++) {
-      if (pixels[i] > maxTemp) { maxTemp = pixels[i]; hottestIndex = i; }
-    }
-    targetX = hottestIndex % GRID_W;
-  }
+// Scan: advance pulse in scanDirection, bounce at limits
+static void doScan() {
+  currentPulse += SCAN_SPEED_US * scanDirection;
+  if (currentPulse >= SCAN_MAX_PULSE) { currentPulse = SCAN_MAX_PULSE; scanDirection = -1; }
+  if (currentPulse <= SCAN_MIN_PULSE) { currentPulse = SCAN_MIN_PULSE; scanDirection =  1; }
+  servo.writeMicroseconds(currentPulse);
+}
 
-  float centerX = GRID_W / 2.0f;
-  float offset = (centerX - targetX) / centerX;  // -1 to +1
+// PID tracking toward a target grid X position.
+// Key changes vs previous version:
+//  - Derivative is computed on a low-pass filtered error, not raw frame-to-frame delta.
+//    This prevents noisy 8x8 data from injecting large Kd spikes that cause overshoot.
+//  - No feedforward term (it amplified overshoot on error-derivative).
+//  - Integral bleeds on deadband entry rather than hard-zero.
+//  - Pulse blend is lighter (more responsive).
+static void doTrack(float targetX) {
+  static float integral      = 0.0f;
+  static int   lastPulse     = 1500;
+  static float filteredError = 0.0f;  // low-pass filtered error for derivative
 
-  if (fabs(offset) < 0.2f) {
+  const float centerX = (GRID_W - 1) / 2.0f;
+  float offset = (centerX - targetX) / centerX;   // −1 .. +1, +ve = target left of centre
+
+  // Deadband: hold still and bleed integral when nearly centred
+  if (fabsf(offset) < 0.08f) {
     servo.writeMicroseconds(1500);
-    integral = 0;
+    integral      *= 0.85f;
+    filteredError  = offset;   // keep filter in sync so derivative is 0 on re-engage
+    lastPulse      = 1500;
     return;
   }
 
+  // Low-pass filter the error for the derivative term (alpha = 0.4)
+  // Smooths out pixel-noise jitter without slowing the proportional response.
+  const float DERIV_ALPHA = 0.4f;
+  float prevFiltered = filteredError;
+  filteredError = DERIV_ALPHA * offset + (1.0f - DERIV_ALPHA) * filteredError;
+  float derivative = filteredError - prevFiltered;
+
+  // Integral with anti-windup clamp
   integral += offset * 0.05f;
-  float derivative = offset - lastOffset;
-  lastOffset = offset;
+  integral  = constrain(integral, -3.0f, 3.0f);
 
   float control = kp * offset + ki * integral + kd * derivative;
 
   int pulse = 1500 + (int)control;
-  pulse = constrain(pulse, 1000, 2000);
-  pulse = (int)(0.7f * lastPulse + 0.3f * pulse);
-  lastPulse = pulse;
+  pulse = constrain(pulse, SCAN_MIN_PULSE, SCAN_MAX_PULSE);
+
+  // Light output smoothing — damps electrical noise, not tracking lag
+  pulse     = (int)(0.80f * pulse + 0.20f * lastPulse);
+  lastPulse  = pulse;
   currentPulse = pulse;
   servo.writeMicroseconds(pulse);
 }
 
-static void logFrame(float tMin, float tMedian, float tMax, int servoPulse) {
-  fs::File logfile = SPIFFS.open("/thermal_log.csv", FILE_APPEND);
-  if (!logfile) return;
-  unsigned long now = millis();
-  logfile.printf("%lu,%.2f,%.2f,%.2f,%d,%.1f,%.1f,%.1f\n",
-                 now, tMin, tMedian, tMax, servoPulse, kp, ki, kd);
-  logfile.close();
+// Main tracking entry point — runs the state machine
+static void updateServo(const float *pix, float ambientTemp) {
+  if (!motorEnabled) { servo.writeMicroseconds(1500); return; }
+
+  float blobX, blobY;
+  bool blobFound = false;
+
+  if (displayMode == MODE_PERSON) {
+    blobFound = getPersonCentroid(pix, ambientTemp, &blobX, &blobY);
+  } else {
+    // Hottest pixel for non-person modes
+    int best = 0; float maxT = pix[0];
+    for (int i=1; i<AMG88xx_PIXEL_ARRAY_SIZE; i++) if(pix[i]>maxT){maxT=pix[i];best=i;}
+    blobX = best % GRID_W;
+    blobY = best / GRID_W;
+    blobFound = true;
+  }
+
+  switch (trackerState) {
+
+    case TS_SCAN:
+      if (blobFound) {
+        trackTargetX    = blobX;
+        trackTargetY    = blobY;
+        trackFound      = true;
+        trackLostFrames = 0;
+        trackerState    = TS_TRACK;
+        doTrack(blobX);
+      } else {
+        trackFound = false;
+        doScan();
+      }
+      break;
+
+    case TS_TRACK:
+      if (blobFound) {
+        trackTargetX    = blobX;
+        trackTargetY    = blobY;
+        trackFound      = true;
+        trackLostFrames = 0;
+        doTrack(blobX);
+      } else {
+        // Lost target — hold position for up to 10 frames before scanning
+        trackLostFrames++;
+        if (trackLostFrames <= 10) {
+          trackerState = TS_HOLD;
+          doTrack(trackTargetX);   // keep servo aimed at last known position
+        } else {
+          trackerState = TS_SCAN;
+          trackFound   = false;
+        }
+      }
+      break;
+
+    case TS_HOLD:
+      if (blobFound) {
+        trackTargetX    = blobX;
+        trackTargetY    = blobY;
+        trackFound      = true;
+        trackLostFrames = 0;
+        trackerState    = TS_TRACK;
+        doTrack(blobX);
+      } else {
+        trackLostFrames++;
+        if (trackLostFrames > 10) {
+          trackerState = TS_SCAN;
+          trackFound   = false;
+        } else {
+          doTrack(trackTargetX);
+        }
+      }
+      break;
+  }
 }
 
-// Main
+// ─────────────────────────────────────────────
+// Logging
+// ─────────────────────────────────────────────
+static void logFrame(float tMin, float tMedian, float tMax, int servoPulse) {
+  fs::File f = SPIFFS.open("/thermal_log.csv", FILE_APPEND);
+  if (!f) return;
+  f.printf("%lu,%.2f,%.2f,%.2f,%d,%.1f,%.1f,%.1f,%s\n",
+           millis(), tMin, tMedian, tMax, servoPulse, kp, ki, kd, trackerStateName());
+  f.close();
+}
+
+// ─────────────────────────────────────────────
+// Setup
+// ─────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  if (!SPIFFS.begin(true)) {
-    Serial.println("SPIFFS mount failed");
-  } else {
-    Serial.println("SPIFFS ready");
-  }
-  Wire.begin(21, 22);
+  if (!SPIFFS.begin(true)) Serial.println("SPIFFS mount failed");
+  else                     Serial.println("SPIFFS ready");
 
+  Wire.begin(21, 22);
   tft.init();
   tft.setRotation(3);
   tft.fillScreen(TFT_BLACK);
-
   analogReadResolution(12);
   pinMode(BATTERY_PIN, INPUT);
 
   if (!amg.begin()) {
-    tft.setTextColor(TFT_RED); tft.drawString("AMG8833 not found!", 10, 10, 2); while (1) { delay(1000); }
+    tft.setTextColor(TFT_RED);
+    tft.drawString("AMG8833 not found!", 10, 10, 2);
+    while(1) delay(1000);
   }
-
   pinMode(BUTTON_INTERP, INPUT_PULLUP);
-  pinMode(BUTTON_RANGE, INPUT_PULLUP);
+  pinMode(BUTTON_RANGE,  INPUT_PULLUP);
 
   tft.setTextColor(TFT_WHITE);
   tft.drawString("Thermal Imager Init OK", 10, 10, 2);
   tft.drawString("Starting Access Point...", 10, 30, 2);
 
-  // Start as WiFi access point so clients can connect directly to the ESP
   WiFi.mode(WIFI_AP);
-  // Build a short, simple SSID based on device MAC for uniqueness
-  String baseSsid = "ThermalCam-";
-  String initMac = WiFi.macAddress();
-  String initSuffix;
-  int initLen = initMac.length();
-  if (initLen >= 5) initSuffix = initMac.substring(initLen - 5);
-  else initSuffix = initMac;
-  initSuffix.replace(":", "");
-  String apSsid = baseSsid + initSuffix;
-  // Explicitly set AP IP and subnet (common default)
-  IPAddress apLocal(192,168,4,1);
-  IPAddress apGateway(192,168,4,1);
-  IPAddress apSubnet(255,255,255,0);
-  WiFi.softAPConfig(apLocal, apGateway, apSubnet);
-  bool apStarted = false;
-  // Start AP on channel 1, not hidden
-  #ifdef WIFI_PASSWORD
-    if (strlen(WIFI_PASSWORD) > 0) apStarted = WiFi.softAP(apSsid.c_str(), WIFI_PASSWORD, 1, 0, 4);
-    else apStarted = WiFi.softAP(apSsid.c_str(), NULL, 1, 0, 4);
-  #else
-    apStarted = WiFi.softAP(apSsid.c_str(), NULL, 1, 0, 4);
-  #endif
+  String mac = WiFi.macAddress();
+  String suf = mac.substring(mac.length()-5); suf.replace(":","");
+  String apSsid = "ThermalCam-" + suf;
+  IPAddress apIP(192,168,4,1);
+  WiFi.softAPConfig(apIP, apIP, IPAddress(255,255,255,0));
 
-  if (apStarted) {
-    IPAddress apIP = WiFi.softAPIP(); deviceIp = apIP.toString();
-    Serial.print("AP started, SSID: "); Serial.print(apSsid); Serial.print(" IP: "); Serial.println(deviceIp);
-    // indicate whether AP is secured (password set) or open
-    bool apSecured = false;
-    #ifdef WIFI_PASSWORD
-      if (strlen(WIFI_PASSWORD) > 0) apSecured = true;
-    #endif
-    Serial.print("AP mode: "); Serial.println(apSecured ? "WPA2-PSK" : "OPEN");
-    tft.fillRect(0, 30, SCREEN_W, 40, TFT_BLACK);
-    tft.drawString("AP started", 10, 30, 2);
-    String ipText = String("AP: ") + deviceIp; tft.drawString(ipText.c_str(), 10, 50, 2);
-    tft.drawString(apSecured ? "Secured" : "Open", 10, 70, 2);
-    // Start mDNS responder so clients can access via hostname.local
-    String mac = WiFi.softAPmacAddress();
-  // create short suffix from MAC (last 5 chars) and remove colons
-  String macSuffix;
-  int len = mac.length();
-  if (len >= 5) macSuffix = mac.substring(len - 5);
-  else macSuffix = mac;
-  macSuffix.replace(":", "");
-  // sanitize SSID for hostname: keep alnum and replace others with '-'
-  String host = apSsid;
-  for (size_t i = 0; i < host.length(); i++) { char c = host.charAt(i); if (!isalnum(c)) host.setCharAt(i, '-'); }
-  String mdnsName = host + "-" + macSuffix;
-  // force lowercase
-  for (size_t i = 0; i < mdnsName.length(); i++) mdnsName.setCharAt(i, tolower(mdnsName.charAt(i)));
-    if (MDNS.begin("thermalcam")) {
-    Serial.println("mDNS responder started: http://thermalcam.local/");
-    
-    } else {
-      Serial.println("mDNS failed to start");
-    }
+  bool ok = false;
+#ifdef WIFI_PASSWORD
+  ok = (strlen(WIFI_PASSWORD)>0)
+     ? WiFi.softAP(apSsid.c_str(), WIFI_PASSWORD, 1, 0, 4)
+     : WiFi.softAP(apSsid.c_str(), NULL, 1, 0, 4);
+#else
+  ok = WiFi.softAP(apSsid.c_str(), NULL, 1, 0, 4);
+#endif
+
+  if (ok) {
+    deviceIp = WiFi.softAPIP().toString();
+    Serial.printf("AP: %s  IP: %s\n", apSsid.c_str(), deviceIp.c_str());
+    tft.fillRect(0,30,SCREEN_W,60,TFT_BLACK);
+    tft.drawString("AP: " + apSsid, 10, 30, 2);
+    tft.drawString(deviceIp, 10, 50, 2);
+    if (MDNS.begin("thermalcam")) Serial.println("mDNS: http://thermalcam.local/");
   } else {
     deviceIp = "not started";
-    Serial.println("Failed to start AP");
-    tft.fillRect(0, 30, SCREEN_W, 40, TFT_BLACK);
+    Serial.println("AP failed");
     tft.drawString("AP failed", 10, 30, 2);
   }
 
-  server.on("/", handleIndex);
-  server.on("/frame", HTTP_GET, handleFrame);
-  server.on("/settings", HTTP_GET, handleSettingsGet);
+  server.on("/",         handleIndex);
+  server.on("/frame",    HTTP_GET,  handleFrame);
+  server.on("/settings", HTTP_GET,  handleSettingsGet);
   server.on("/settings", HTTP_POST, handleSettingsPost);
   server.onNotFound(handleNotFound);
   server.begin();
@@ -809,56 +929,61 @@ void setup() {
   delay(500);
   tft.fillScreen(TFT_BLACK);
   servo.attach(SERVO_PIN);
-servo.writeMicroseconds(1500);  // neutral stop
-
+  servo.writeMicroseconds(1500);
 }
 
+// ─────────────────────────────────────────────
+// Loop
+// ─────────────────────────────────────────────
 void loop() {
   server.handleClient();
-
-  // For AP mode the softAP IP is static while AP is running
   deviceIp = WiFi.softAPIP().toString();
 
   amg.readPixels(pixels);
   float medianTemp = computeMedian(pixels, AMG88xx_PIXEL_ARRAY_SIZE);
-  trackHottestPixel(pixels);
 
+  updateServo(pixels, medianTemp);
+
+  // Build display buffer
   const float *framePixels = pixels;
   float tMin, tMax;
   if (useManualRange) {
     tMin = manualMin; tMax = manualMax;
   } else {
-    for (int i = 0; i < AMG88xx_PIXEL_ARRAY_SIZE; i++) displayPixels[i] = suppressAmbientNoise(pixels[i], medianTemp);
-    float targetMin, targetMax; framePixels = displayPixels;
-    computeDisplayRange(displayPixels, AMG88xx_PIXEL_ARRAY_SIZE, &targetMin, &targetMax);
-    applyRangeSmoothing(targetMin, targetMax, &tMin, &tMax);
+    for (int i=0;i<AMG88xx_PIXEL_ARRAY_SIZE;i++)
+      displayPixels[i] = suppressAmbientNoise(pixels[i], medianTemp);
+    framePixels = displayPixels;
+    float tgMin, tgMax;
+    computeDisplayRange(displayPixels, AMG88xx_PIXEL_ARRAY_SIZE, &tgMin, &tgMax);
+    applyRangeSmoothing(tgMin, tgMax, &tMin, &tMax);
   }
 
   checkButtons();
-  // Rotate for web feed (flip to match orientation)
-  for (int y = 0; y < GRID_H; y++) {
-    for (int x = 0; x < GRID_W; x++) {
-      int srcIndex = y * GRID_W + x;
-      int dstIndex = (GRID_H - 1 - y) * GRID_W + (GRID_W - 1 - x);
-      latestFrame[dstIndex] = framePixels[srcIndex];
-    }
+
+  // Mirror frame for web feed
+  for (int y=0;y<GRID_H;y++)
+    for (int x=0;x<GRID_W;x++)
+      latestFrame[(GRID_H-1-y)*GRID_W+(GRID_W-1-x)] = framePixels[y*GRID_W+x];
+  latestFrameMin=tMin; latestFrameMax=tMax;
+  latestFrameMedian=medianTemp; latestFrameMillis=millis(); frameAvailable=true;
+
+  // Draw
+  if (useInterpolation) {
+    bilinearInterpolate(framePixels, interpBuf, GRID_W, GRID_H, UPSCALE);
+    drawHeatmapTFT(interpBuf, tMin, tMax, medianTemp, INTERP_W, INTERP_H);
+  } else {
+    drawHeatmapTFT(framePixels, tMin, tMax, medianTemp, GRID_W, GRID_H);
   }
-  latestFrameMin = tMin; latestFrameMax = tMax; latestFrameMedian = medianTemp; latestFrameMillis = millis(); frameAvailable = true;
 
-  // Draw image
-  if (useInterpolation) { bilinearInterpolate(framePixels, interpBuf, GRID_W, GRID_H, UPSCALE); drawInterpolatedHeatmap(interpBuf, tMin, tMax); }
-  else { drawHeatmap(framePixels, tMin, tMax); }
-
-  // Overlay: temporarily set rotation to draw UI consistently
-  uint8_t prevRot = tft.getRotation(); tft.setRotation(3);
+  uint8_t prevRot = tft.getRotation();
+  tft.setRotation(3);
   drawModeIndicator();
   drawTempStats(tMin, tMax, medianTemp);
-  float battV = readBatteryVoltage(); int battW = 32, battH = 14; int battX = tft.width() - battW - 6; int battY = 6; drawBatteryIndicator(battX, battY, battW, battH, battV);
+  drawTrackingIndicator();
+  drawBatteryIndicator(tft.width()-38, 6, 32, 14, readBatteryVoltage());
   tft.setRotation(prevRot);
 
-  // Small pacing and allow web server to run
   delay(60);
-  for (int i = 0; i < 6; i++) { server.handleClient(); delay(15); }
+  for (int i=0;i<6;i++){server.handleClient();delay(15);}
   logFrame(latestFrameMin, latestFrameMedian, latestFrameMax, currentPulse);
-
 }
