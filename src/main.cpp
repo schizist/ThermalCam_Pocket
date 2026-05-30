@@ -1,6 +1,5 @@
 // Thermal Imager with Web UI and T-Display rendering
-// v3: overshoot fix (filtered derivative, removed feedforward),
-//     scan mode when no target found, improved PID defaults
+// v4: default mode = PERSON, improved button debounce
 
 #include <Arduino.h>
 #include <Wire.h>
@@ -14,6 +13,11 @@
 #include <cmath>
 #include <ESP32Servo.h>
 #include <SPIFFS.h>
+#include <ArduinoOTA.h>
+
+#ifndef OTA_PASSWORD
+#define OTA_PASSWORD ""
+#endif
 
 Servo servo;
 const int SERVO_PIN = 27;
@@ -37,7 +41,7 @@ float displayPixels[AMG88xx_PIXEL_ARRAY_SIZE];
 // Defaults chosen conservatively; tune up Kp first via web UI.
 float kp = 35.0f;
 float ki =  3.0f;
-float kd = 15.0f;
+float kd = 12.0f;
 
 // Scan behaviour
 // When no target is found the servo sweeps slowly across the full range.
@@ -49,8 +53,9 @@ static const int   SCAN_MAX_PULSE  = 2500; // full 360° range upper bound
 static int         scanDirection   = 1;    // +1 or -1
 
 enum DisplayMode { MODE_THERMAL = 0, MODE_GRAYSCALE = 1, MODE_PERSON = 2 };
-DisplayMode displayMode = MODE_THERMAL;
+DisplayMode displayMode = MODE_PERSON;
 int currentPulse = 1500;
+bool motorEnabled = true;
 
 // Dynamic human temp range — offset from median (ambient).
 // A pixel is "human" if it is HUMAN_ABOVE_MIN..HUMAN_ABOVE_MAX °C above ambient.
@@ -232,6 +237,12 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
     .state-track { background:#1a4a1a; color:#4f4; }
     .state-hold  { background:#4a3a00; color:#fc0; }
     .state-scan  { background:#2a1a4a; color:#a8f; }
+    .mode-btn { background:#2a2a2a; border:1px solid #444; border-radius:6px; color:#ccc;
+                padding:.35rem .75rem; cursor:pointer; font-size:.9rem; }
+    .mode-btn.active { background:#0a3a5a; border-color:#08f; color:#8df; font-weight:600; }
+    button.motor-btn { background:#2a2a2a; border:1px solid #444; border-radius:6px; color:#ccc;
+                       padding:.35rem .75rem; cursor:pointer; font-size:.9rem; width:100%; }
+    button.motor-btn.on { background:#1a4a1a; border-color:#2c2; color:#4f4; font-weight:600; }
   </style>
 </head>
 <body>
@@ -267,7 +278,14 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
       <label>Kd: <strong><span id="kdVal">--</span></strong>
         <input type="range" id="kd" min="0" max="100" step="1">
       </label>
-      <div class="status">State:
+      <div class="group-title">Display &amp; Motor</div>
+      <div class="toggle-row">
+        <button class="mode-btn" data-mode="0">Thermal</button>
+        <button class="mode-btn" data-mode="1">Gray</button>
+        <button class="mode-btn" data-mode="2">Person</button>
+      </div>
+      <button class="motor-btn" id="motorBtn">Motor: ON</button>
+      <div class="status" style="margin-top:.75rem">State:
         <span id="tracker-state" class="state-badge state-scan">SCAN</span>
       </div>
       <div class="status">Target: <span id="target-pos">--</span></div>
@@ -318,6 +336,23 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
     document.getElementById('toggleInterp').addEventListener('change', e =>
       queue('useInterpolation', e.target.checked));
 
+    const modeBtns = document.querySelectorAll('.mode-btn');
+    const motorBtn = document.getElementById('motorBtn');
+    let motorOn = true;
+
+    modeBtns.forEach(btn => btn.addEventListener('click', () => {
+      const m = parseInt(btn.dataset.mode);
+      queue('displayMode', m);
+      modeBtns.forEach(b => b.classList.toggle('active', parseInt(b.dataset.mode) === m));
+    }));
+
+    motorBtn.addEventListener('click', () => {
+      motorOn = !motorOn;
+      queue('motorEnabled', motorOn);
+      motorBtn.textContent = motorOn ? 'Motor: ON' : 'Motor: OFF';
+      motorBtn.classList.toggle('on', motorOn);
+    });
+
     function applySettings(d) {
       const tm = document.getElementById('toggleManual');
       const ti = document.getElementById('toggleInterp');
@@ -331,6 +366,14 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
       if (document.activeElement !== slKp) { slKp.value = d.kp; document.getElementById('kpVal').textContent = d.kp.toFixed(0); }
       if (document.activeElement !== slKi) { slKi.value = d.ki; document.getElementById('kiVal').textContent = d.ki.toFixed(1); }
       if (document.activeElement !== slKd) { slKd.value = d.kd; document.getElementById('kdVal').textContent = d.kd.toFixed(0); }
+      if (d.displayMode !== undefined) {
+        modeBtns.forEach(b => b.classList.toggle('active', parseInt(b.dataset.mode) === d.displayMode));
+      }
+      if (d.motorEnabled !== undefined) {
+        motorOn = d.motorEnabled;
+        motorBtn.textContent = motorOn ? 'Motor: ON' : 'Motor: OFF';
+        motorBtn.classList.toggle('on', motorOn);
+      }
     }
 
     function thermalColor(r) {
@@ -464,7 +507,7 @@ static void sendJson(const JsonDocument &doc) {
   String p; serializeJson(doc, p); server.send(200, "application/json", p);
 }
 static void sendJsonError(int code, const char *msg) {
-  StaticJsonDocument<128> doc; doc["error"] = msg;
+  JsonDocument doc; doc["error"] = msg;
   String p; serializeJson(doc, p); server.send(code, "application/json", p);
 }
 static void handleIndex() { server.send_P(200, "text/html", INDEX_HTML); }
@@ -478,7 +521,7 @@ static const char *trackerStateName() {
 }
 
 static void handleFrame() {
-  StaticJsonDocument<4096> doc;
+  JsonDocument doc;
   doc["frameReady"]       = frameAvailable;
   doc["ip"]               = deviceIp;
   doc["useInterpolation"] = useInterpolation;
@@ -498,18 +541,18 @@ static void handleFrame() {
     doc["tMin"]      = latestFrameMin;
     doc["tMax"]      = latestFrameMax;
     doc["median"]    = latestFrameMedian;
-    JsonArray arr = doc.createNestedArray("pixels");
+    JsonArray arr = doc["pixels"].to<JsonArray>();
     for (int i = 0; i < AMG88xx_PIXEL_ARRAY_SIZE; i++) arr.add(latestFrame[i]);
   } else {
     doc["timestamp"] = 0;
     doc["tMin"]   = manualMin; doc["tMax"] = manualMax; doc["median"] = 0;
-    doc.createNestedArray("pixels");
+    doc["pixels"].to<JsonArray>();
   }
   sendJson(doc);
 }
 
 static void handleSettingsGet() {
-  StaticJsonDocument<256> doc;
+  JsonDocument doc;
   doc["manualMin"]        = manualMin;
   doc["manualMax"]        = manualMax;
   doc["useManualRange"]   = useManualRange;
@@ -518,20 +561,27 @@ static void handleSettingsGet() {
   doc["ki"]  = ki;
   doc["kd"]  = kd;
   doc["ip"]  = deviceIp;
+  doc["displayMode"]  = (int)displayMode;
+  doc["motorEnabled"] = motorEnabled;
   sendJson(doc);
 }
 
 static void handleSettingsPost() {
   if (!server.hasArg("plain")) { sendJsonError(400, "Missing body"); return; }
-  StaticJsonDocument<512> doc;
+  JsonDocument doc;
   if (deserializeJson(doc, server.arg("plain"))) { sendJsonError(400, "Invalid JSON"); return; }
-  if (doc.containsKey("manualMin"))        manualMin        = doc["manualMin"].as<float>();
-  if (doc.containsKey("manualMax"))        manualMax        = doc["manualMax"].as<float>();
-  if (doc.containsKey("useManualRange"))   useManualRange   = doc["useManualRange"].as<bool>();
-  if (doc.containsKey("useInterpolation")) useInterpolation = doc["useInterpolation"].as<bool>();
-  if (doc.containsKey("kp")) kp = doc["kp"].as<float>();
-  if (doc.containsKey("ki")) ki = doc["ki"].as<float>();
-  if (doc.containsKey("kd")) kd = doc["kd"].as<float>();
+  if (!doc["manualMin"].isNull())        manualMin        = doc["manualMin"].as<float>();
+  if (!doc["manualMax"].isNull())        manualMax        = doc["manualMax"].as<float>();
+  if (!doc["useManualRange"].isNull())   useManualRange   = doc["useManualRange"].as<bool>();
+  if (!doc["useInterpolation"].isNull()) useInterpolation = doc["useInterpolation"].as<bool>();
+  if (!doc["kp"].isNull()) kp = doc["kp"].as<float>();
+  if (!doc["ki"].isNull()) ki = doc["ki"].as<float>();
+  if (!doc["kd"].isNull()) kd = doc["kd"].as<float>();
+  if (!doc["displayMode"].isNull())  displayMode  = (DisplayMode)doc["displayMode"].as<int>();
+  if (!doc["motorEnabled"].isNull()) {
+    motorEnabled = doc["motorEnabled"].as<bool>();
+    if (!motorEnabled) servo.writeMicroseconds(1500);
+  }
   handleSettingsGet();
 }
 
@@ -544,8 +594,8 @@ static void handleNotFound() {
 // Power
 // ─────────────────────────────────────────────
 static void powerOff() {
-  tft.writecommand(ST7789_DISPOFF);
-  tft.writecommand(ST7789_SLPIN);
+  tft.writecommand(TFT_DISPOFF);
+  tft.writecommand(0x10);  // SLPIN
   esp_deep_sleep_start();
 }
 
@@ -579,35 +629,65 @@ static uint16_t tempToColor(float temp, float tMin, float tMax, float ambient) {
 // ─────────────────────────────────────────────
 // Buttons
 // ─────────────────────────────────────────────
-bool lastInterpState = HIGH;
-bool lastRangeState  = HIGH;
-unsigned long lastRangeToggle = 0;
-static bool motorEnabled = true;
+static const unsigned long LONG_MIN_MS = 1500;  // hold longer than this → long press
 
 static void checkButtons() {
-  int iR = digitalRead(BUTTON_INTERP);
-  int rR = digitalRead(BUTTON_RANGE);
+  unsigned long now = millis();
 
-  static unsigned long iPress = 0;
-  if (iR==LOW && lastInterpState==HIGH) iPress = millis();
-  if (iR==HIGH && lastInterpState==LOW) {
-    unsigned long dur = millis()-iPress;
-    if (dur < 800) displayMode = (DisplayMode)((displayMode+1)%3);
-    else { motorEnabled = !motorEnabled; if (!motorEnabled) servo.writeMicroseconds(1500); }
-  }
-  lastInterpState = iR;
+  // GPIO0 — short press: cycle display mode   long press: toggle motor
+  {
+    static bool prev      = HIGH;
+    static unsigned long pressAt  = 0;
+    static bool longFired = false;
 
-  static unsigned long rPress = 0;
-  if (rR==LOW && lastRangeState==HIGH) rPress = millis();
-  if (rR==HIGH && lastRangeState==LOW) {
-    if (millis()-rPress < 2000 && millis()-lastRangeToggle > 250) {
-      useManualRange = !useManualRange;
-      lastRangeToggle = millis();
-      autoRangeInitialized = false;
+    bool cur = (digitalRead(BUTTON_INTERP) == LOW);
+
+    if (cur && !prev) {                              // falling edge: pressed
+      pressAt   = now;
+      longFired = false;
+      Serial.println("[BTN0] pressed");
     }
+    if (cur && !longFired && (now - pressAt) > LONG_MIN_MS) {
+      longFired    = true;
+      motorEnabled = !motorEnabled;
+      if (!motorEnabled) servo.writeMicroseconds(1500);
+      Serial.printf("[BTN0] long → motor %s\n", motorEnabled ? "ON" : "OFF");
+    }
+    if (!cur && prev) {                              // rising edge: released
+      if (!longFired) {
+        displayMode = (DisplayMode)((displayMode + 1) % 3);
+        Serial.printf("[BTN0] short → mode %d\n", (int)displayMode);
+      }
+    }
+    prev = cur;
   }
-  if (rR==LOW && millis()-rPress > 2000) powerOff();
-  lastRangeState = rR;
+
+  // GPIO35 — short press: toggle manual range   long press: power off
+  {
+    static bool prev      = HIGH;
+    static unsigned long pressAt  = 0;
+    static bool longFired = false;
+
+    bool cur = (digitalRead(BUTTON_RANGE) == LOW);
+
+    if (cur && !prev) {
+      pressAt   = now;
+      longFired = false;
+      Serial.println("[BTN35] pressed");
+    }
+    if (cur && !longFired && (now - pressAt) > LONG_MIN_MS) {
+      longFired = true;
+      powerOff();
+    }
+    if (!cur && prev) {
+      if (!longFired) {
+        useManualRange       = !useManualRange;
+        autoRangeInitialized = false;
+        Serial.printf("[BTN35] short → manualRange %d\n", (int)useManualRange);
+      }
+    }
+    prev = cur;
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -688,12 +768,14 @@ static void drawHeatmapTFT(const float *pix, float tMin, float tMax, float ambie
   int W=tft.width(), H=tft.height();
   int cW=(W+gW-1)/gW, cH=(H+gH-1)/gH;
   int x0=(W-cW*gW)/2, y0=(H-cH*gH)/2;
-  tft.startWrite();
-  for(int y=0;y<gH;y++) for(int x=0;x<gW;x++){
-    tft.fillRect(x0+x*cW, y0+y*cH, cW, cH,
-                 tempToColor(pix[y*gW+x], tMin, tMax, ambient));
+  for(int y=0;y<gH;y++){
+    tft.startWrite();
+    for(int x=0;x<gW;x++)
+      tft.fillRect(x0+x*cW, y0+y*cH, cW, cH,
+                   tempToColor(pix[y*gW+x], tMin, tMax, ambient));
+    tft.endWrite();
+    checkButtons();  // poll inputs between rows so presses aren't missed during slow draws
   }
-  tft.endWrite();
 }
 
 static void drawTrackingIndicator() {
@@ -926,6 +1008,28 @@ void setup() {
   server.onNotFound(handleNotFound);
   server.begin();
 
+  // OTA — password from .env via OTA_PASSWORD define
+  ArduinoOTA.setHostname("thermalcam");
+  if (strlen(OTA_PASSWORD) > 0) ArduinoOTA.setPassword(OTA_PASSWORD);
+  ArduinoOTA.onStart([]() {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextColor(TFT_WHITE);
+    tft.drawString("OTA update starting...", 10, 10, 2);
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "OTA: %u%%", progress * 100 / total);
+    tft.fillRect(0, 30, SCREEN_W, 20, TFT_BLACK);
+    tft.setTextColor(TFT_GREEN);
+    tft.drawString(buf, 10, 30, 2);
+  });
+  ArduinoOTA.onError([](ota_error_t) {
+    tft.fillRect(0, 50, SCREEN_W, 20, TFT_BLACK);
+    tft.setTextColor(TFT_RED);
+    tft.drawString("OTA error!", 10, 50, 2);
+  });
+  ArduinoOTA.begin();
+
   delay(500);
   tft.fillScreen(TFT_BLACK);
   servo.attach(SERVO_PIN);
@@ -936,6 +1040,7 @@ void setup() {
 // Loop
 // ─────────────────────────────────────────────
 void loop() {
+  ArduinoOTA.handle();
   server.handleClient();
   deviceIp = WiFi.softAPIP().toString();
 
@@ -983,7 +1088,7 @@ void loop() {
   drawBatteryIndicator(tft.width()-38, 6, 32, 14, readBatteryVoltage());
   tft.setRotation(prevRot);
 
-  delay(60);
-  for (int i=0;i<6;i++){server.handleClient();delay(15);}
+  // Poll buttons and web server frequently so short taps (<150 ms) aren't missed
+  for (int i = 0; i < 10; i++) { checkButtons(); server.handleClient(); delay(15); }
   logFrame(latestFrameMin, latestFrameMedian, latestFrameMax, currentPulse);
 }
