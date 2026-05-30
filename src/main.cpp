@@ -217,12 +217,10 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
     body { margin:0 auto; max-width:960px; padding:1.5rem; background:#111; color:#f0f0f0; }
     h1 { font-weight:600; margin-bottom:1rem; text-align:center; }
     .viewer { display:flex; flex-wrap:wrap; gap:1.5rem; justify-content:center; align-items:flex-start; }
-    .canvasWrap { position:relative; display:inline-block; }
+    .canvasWrap { display:inline-block; }
     canvas { border:1px solid #2f2f2f; border-radius:8px; display:block;
              width:min(90vw,320px); height:min(90vw,320px);
              image-rendering:pixelated; background:#000; }
-    #overlay { position:absolute; top:0; left:0; pointer-events:none;
-               width:min(90vw,320px); height:min(90vw,320px); }
     .panel { background:#222c; border-radius:12px; padding:1rem 1.25rem;
              min-width:280px; box-shadow:0 10px 30px #0006; }
     .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(100px,1fr));
@@ -253,7 +251,6 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
   <div class="viewer">
     <div class="canvasWrap">
       <canvas id="heatmap" width="320" height="320"></canvas>
-      <canvas id="overlay" width="320" height="320"></canvas>
     </div>
     <div class="panel">
       <div class="stats">
@@ -298,9 +295,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
   </div>
   <script>
     const heatmap = document.getElementById('heatmap');
-    const overlay = document.getElementById('overlay');
-    const ctx  = heatmap.getContext('2d');
-    const octx = overlay.getContext('2d');
+    const ctx = heatmap.getContext('2d');
     ctx.imageSmoothingEnabled = false;
 
     const GRID = 8, UP = 8, ISIZE = GRID * UP;
@@ -420,36 +415,30 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
       }
     }
 
-    // Crosshair + scan arc indicator
+    // Tracking indicators drawn on top of the heatmap (same canvas)
     function drawOverlay(d) {
-      octx.clearRect(0, 0, 320, 320);
       const cw = 320/GRID, ch = 320/GRID;
+      ctx.lineWidth = 2;
 
       if (d.trackerState === 'SCAN') {
-        // Animate a sweeping arc to indicate scan
-        const sweepX = (d.scanPulse - 500) / (2500 - 500);  // 0..1
-        const sx = sweepX * 320;
-        octx.strokeStyle = 'rgba(160,128,255,0.7)';
-        octx.lineWidth = 2;
-        octx.setLineDash([6, 4]);
-        octx.beginPath(); octx.moveTo(sx, 0); octx.lineTo(sx, 320); octx.stroke();
-        octx.setLineDash([]);
+        const sx = (d.scanPulse - 500) / (2500 - 500) * 320;
+        ctx.strokeStyle = 'rgba(160,128,255,0.8)';
+        ctx.setLineDash([6, 4]);
+        ctx.beginPath(); ctx.moveTo(sx, 0); ctx.lineTo(sx, 320); ctx.stroke();
+        ctx.setLineDash([]);
         return;
       }
 
+      ctx.setLineDash([]);
       if (!d.targetFound) return;
 
       const cx = (d.targetX + 0.5) * cw;
       const cy = (d.targetY + 0.5) * ch;
       const r  = cw * 0.85;
-      const color = d.trackerState === 'HOLD'
-                  ? 'rgba(255,200,0,0.85)'
-                  : 'rgba(0,255,128,0.9)';
-      octx.strokeStyle = color;
-      octx.lineWidth = 2;
-      octx.beginPath(); octx.arc(cx, cy, r, 0, 2*Math.PI); octx.stroke();
-      octx.beginPath(); octx.moveTo(cx-r*1.6, cy); octx.lineTo(cx+r*1.6, cy); octx.stroke();
-      octx.beginPath(); octx.moveTo(cx, cy-r*1.6); octx.lineTo(cx, cy+r*1.6); octx.stroke();
+      ctx.strokeStyle = d.trackerState === 'HOLD' ? 'rgba(255,200,0,0.9)' : 'rgba(0,255,128,0.95)';
+      ctx.beginPath(); ctx.arc(cx, cy, r, 0, 2*Math.PI); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(cx-r*1.6, cy); ctx.lineTo(cx+r*1.6, cy); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(cx, cy-r*1.6); ctx.lineTo(cx, cy+r*1.6); ctx.stroke();
     }
 
     function updateFrameAge() {
@@ -483,6 +472,10 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
         document.getElementById('last-frame').textContent = 'disconnected';
       });
     }
+
+    // Pre-select Person mode (matches firmware default) before first settings fetch
+    modeBtns.forEach(b => b.classList.toggle('active', b.dataset.mode === '2'));
+    motorBtn.classList.add('on');
 
     fetch('/settings').then(r=>r.json()).then(applySettings).catch(console.error);
     fetchFrame();
@@ -707,8 +700,8 @@ static void drawModeIndicator() {
   const char *lbl; uint16_t col;
   switch(displayMode){
     case MODE_GRAYSCALE: lbl="GRAY";    col=TFT_WHITE; break;
-    case MODE_PERSON:    lbl="THERMAL";  col=TFT_GREEN; break;
-    default:             lbl="PERSON"; col=TFT_CYAN;  break;
+    case MODE_PERSON:    lbl="PERSON";  col=TFT_GREEN; break;
+    default:             lbl="THERMAL"; col=TFT_CYAN;  break;
   }
   tft.setTextColor(col, TFT_BLACK);
   tft.drawString(lbl, 6, 6, 2);
