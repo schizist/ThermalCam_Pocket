@@ -219,7 +219,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
     .viewer { display:flex; flex-wrap:wrap; gap:1.5rem; justify-content:center; align-items:flex-start; }
     .canvasWrap { display:inline-block; }
     canvas { border:1px solid #2f2f2f; border-radius:8px; display:block;
-             width:min(90vw,320px); height:min(90vw,320px);
+             width:min(90vw,320px); height:auto; aspect-ratio:16/9;
              image-rendering:pixelated; background:#000; }
     .panel { background:#222c; border-radius:12px; padding:1rem 1.25rem;
              min-width:280px; box-shadow:0 10px 30px #0006; }
@@ -250,7 +250,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
   <h1>ThermalCam Live Viewer</h1>
   <div class="viewer">
     <div class="canvasWrap">
-      <canvas id="heatmap" width="320" height="320"></canvas>
+      <canvas id="heatmap" width="320" height="180"></canvas>
     </div>
     <div class="panel">
       <div class="stats">
@@ -396,35 +396,59 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
       }
     }
 
-    function drawHeatmap(pixels, minT, maxT, interp) {
+    function pixelColor(temp, minT, maxT, mode, ambient) {
       const rng = (maxT - minT) || 1;
-      ctx.clearRect(0, 0, 320, 320);
+      const ratio = Math.pow(Math.max(0, Math.min(1, (temp - minT) / rng)), 0.6);
+      if (mode === 2) {
+        // Person: white if within human-above-ambient band, else dark blue
+        const lo = ambient + 1.5, hi = ambient + 12.0;
+        if (temp >= lo && temp <= hi) return '#ffffff';
+        const b = Math.round(30 * ratio);
+        return `rgb(0,0,${b})`;
+      }
+      if (mode === 1) {
+        const v = Math.round(255 * ratio);
+        return `rgb(${v},${v},${v})`;
+      }
+      return thermalColor(ratio);
+    }
+
+    function drawHeatmap(pixels, minT, maxT, interp, mode, ambient) {
+      mode = mode || 0; ambient = ambient || 0;
+      ctx.clearRect(0, 0, 320, 180);
+      ctx.save();
+      ctx.translate(320, 180);
+      ctx.rotate(Math.PI);
       if (interp) {
         bilinear(pixels, interpBuf);
-        const cw = 320/ISIZE, ch = 320/ISIZE;
+        const cw = 320/ISIZE, ch = 180/ISIZE;
         for (let y=0; y<ISIZE; y++) for (let x=0; x<ISIZE; x++) {
-          ctx.fillStyle = thermalColor(Math.pow((interpBuf[y*ISIZE+x]-minT)/rng, 0.6));
+          ctx.fillStyle = pixelColor(interpBuf[y*ISIZE+x], minT, maxT, mode, ambient);
           ctx.fillRect(x*cw, y*ch, cw, ch);
         }
       } else {
-        const cw = 320/GRID, ch = 320/GRID;
+        const cw = 320/GRID, ch = 180/GRID;
         for (let y=0; y<GRID; y++) for (let x=0; x<GRID; x++) {
-          ctx.fillStyle = thermalColor(Math.pow((pixels[y*GRID+x]-minT)/rng, 0.6));
+          ctx.fillStyle = pixelColor(pixels[y*GRID+x], minT, maxT, mode, ambient);
           ctx.fillRect(x*cw, y*ch, cw, ch);
         }
       }
+      ctx.restore();
     }
 
-    // Tracking indicators drawn on top of the heatmap (same canvas)
+    // Tracking indicators drawn on top of the heatmap (same canvas).
+    // drawHeatmap draws with a 180° canvas transform then restores, so overlay
+    // draws in the unrotated canvas space and must use mirrored coordinates to
+    // land on the same visual pixel as the rotated heatmap.
     function drawOverlay(d) {
-      const cw = 320/GRID, ch = 320/GRID;
+      const cw = 320/GRID, ch = 180/GRID;
       ctx.lineWidth = 2;
 
       if (d.trackerState === 'SCAN') {
-        const sx = (d.scanPulse - 500) / (2500 - 500) * 320;
+        const sx = 320 - (d.scanPulse - 500) / (2500 - 500) * 320;
         ctx.strokeStyle = 'rgba(160,128,255,0.8)';
         ctx.setLineDash([6, 4]);
-        ctx.beginPath(); ctx.moveTo(sx, 0); ctx.lineTo(sx, 320); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(sx, 0); ctx.lineTo(sx, 180); ctx.stroke();
         ctx.setLineDash([]);
         return;
       }
@@ -432,8 +456,8 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
       ctx.setLineDash([]);
       if (!d.targetFound) return;
 
-      const cx = (d.targetX + 0.5) * cw;
-      const cy = (d.targetY + 0.5) * ch;
+      const cx = 320 - (d.targetX + 0.5) * cw;
+      const cy = 180 - (d.targetY + 0.5) * ch;
       const r  = cw * 0.85;
       ctx.strokeStyle = d.trackerState === 'HOLD' ? 'rgba(255,200,0,0.9)' : 'rgba(0,255,128,0.95)';
       ctx.beginPath(); ctx.arc(cx, cy, r, 0, 2*Math.PI); ctx.stroke();
@@ -455,7 +479,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
         applySettings(d);
         if (d.ip) document.getElementById('ip-address').textContent = d.ip;
         if (!d.frameReady) return;
-        drawHeatmap(d.pixels, d.tMin, d.tMax, d.useInterpolation);
+        drawHeatmap(d.pixels, d.tMin, d.tMax, d.useInterpolation, d.displayMode || 0, d.median || 0);
         drawOverlay(d);
         document.getElementById('stat-min').textContent    = `${d.tMin.toFixed(1)}°`;
         document.getElementById('stat-max').textContent    = `${d.tMax.toFixed(1)}°`;
@@ -532,6 +556,7 @@ static void handleFrame() {
   doc["targetY"]       = trackTargetY;
   doc["trackerState"]  = trackerStateName();
   doc["scanPulse"]     = currentPulse;
+  doc["displayMode"]   = (int)displayMode;
   if (frameAvailable) {
     doc["timestamp"] = latestFrameMillis;
     doc["tMin"]      = latestFrameMin;
