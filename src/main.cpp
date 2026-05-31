@@ -42,7 +42,7 @@ float displayPixels[AMG88xx_PIXEL_ARRAY_SIZE];
 // PID — kff removed; derivative is now computed on a low-pass filtered error
 // to prevent noise-amplified kicks that cause overshoot.
 // Defaults chosen conservatively; tune up Kp first via web UI.
-float kp = 35.0f;
+float kp = 65.0f;
 float ki =  3.0f;
 float kd = 12.0f;
 
