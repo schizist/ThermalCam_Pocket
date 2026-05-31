@@ -651,10 +651,11 @@ static const unsigned long LONG_MIN_MS = 1500;  // hold longer than this → lon
 
 static void checkButtons() {
   unsigned long now = millis();
+  if (now < 2000) return;  // GPIO0 is briefly LOW during ESP32 boot; ignore until stable
 
   // GPIO0 — short press: cycle display mode   long press: toggle motor
   {
-    static bool prev      = HIGH;
+    static bool prev      = false;
     static unsigned long pressAt  = 0;
     static bool longFired = false;
 
@@ -682,7 +683,7 @@ static void checkButtons() {
 
   // GPIO35 — short press: toggle manual range   long press: power off
   {
-    static bool prev      = HIGH;
+    static bool prev      = false;
     static unsigned long pressAt  = 0;
     static bool longFired = false;
 
@@ -727,6 +728,8 @@ static void drawModeIndicator() {
   }
   tft.setTextColor(col, TFT_BLACK);
   tft.drawString(lbl, 6, 6, 2);
+  tft.setTextColor(motorEnabled ? TFT_GREEN : TFT_RED, TFT_BLACK);
+  tft.drawString(motorEnabled ? "MOT:ON " : "MOT:OFF", 6, 22, 1);
 }
 
 static void drawTempStats(float tMin, float tMax, float median) {
@@ -975,6 +978,7 @@ void setup() {
   tft.init();
   tft.setRotation(3);
   tft.fillScreen(TFT_BLACK);
+  displayMode = MODE_PERSON;
   analogReadResolution(12);
   pinMode(BATTERY_PIN, INPUT);
 
