@@ -76,8 +76,9 @@ static const float HUMAN_ABOVE_MAX = 12.0f;
 #define BATTERY_MAX_V           4.2f
 
 static float readBatteryVoltage() {
-  int raw = analogRead(BATTERY_PIN);
-  return (raw / 4095.0f) * 3.3f * BATTERY_VOLTAGE_DIVIDER;
+  uint32_t sum = 0;
+  for (int i = 0; i < 16; i++) sum += analogReadMilliVolts(BATTERY_PIN);
+  return (sum / 16000.0f) * BATTERY_VOLTAGE_DIVIDER;
 }
 
 static void drawBatteryIndicator(int x, int y, int w, int h, float voltage) {
