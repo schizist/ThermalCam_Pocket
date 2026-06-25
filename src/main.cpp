@@ -1,6 +1,6 @@
 // Doll Head Thermal Tracker v2
-// 28BYJ-48 + ULN2003 for pan rotation (thermal tracking)
-// 9g servo on GPIO13 for eyelid blink — detach when idle, no buzz
+// 90g servo on GPIO13 for pan rotation (thermal tracking)
+// 90g servo on GPIO32 for eyelid blink
 // AMG8833 on I2C GPIO21/22
 // WiFi + OTA + web UI with interpolation and display modes
 
@@ -11,7 +11,6 @@
 #include <ESPmDNS.h>
 #include <ArduinoJson.h>
 #include <Adafruit_AMG88xx.h>
-#include <ESP32Servo.h>
 #include <ArduinoOTA.h>
 #include <algorithm>
 #include <cmath>
@@ -29,45 +28,38 @@
 // ─────────────────────────────────────────────
 // Pin definitions
 // ─────────────────────────────────────────────
-#define STEPPER_IN1  25
-#define STEPPER_IN2  26
-#define STEPPER_IN3  27
-#define STEPPER_IN4  14
-#define BLINK_SERVO_PIN 13
+#define ROTATE_SERVO_PIN 13
+#define BLINK_SERVO_PIN  32
 
 // ─────────────────────────────────────────────
-// 28BYJ-48 stepper (half-step, 8-phase)
+// Servo PWM — direct LEDC (Arduino 3.x native API)
+// ESP32Servo bypasses the peripheral manager and corrupts LEDC state
+// across soft resets; driving LEDC directly avoids that entirely.
 // ─────────────────────────────────────────────
-static const int STEP_SEQ[8][4] = {
-  {1,0,0,0},{1,1,0,0},{0,1,0,0},{0,1,1,0},
-  {0,0,1,0},{0,0,1,1},{0,0,0,1},{1,0,0,1},
-};
-static int  stepIndex    = 0;
-static int  stepDelayUs  = 1500;
-static long stepPosition = 0;
+static const uint32_t SERVO_FREQ       = 50;
+static const uint8_t  SERVO_RESOLUTION = 16;
+static const float    SERVO_MIN_US     = 1000.0f;
+static const float    SERVO_MAX_US     = 2000.0f;
+static const float    SERVO_PERIOD_US  = 20000.0f;
 
-static void stepperStep(int direction) {
-  stepIndex = (stepIndex + direction + 8) % 8;
-  digitalWrite(STEPPER_IN1, STEP_SEQ[stepIndex][0]);
-  digitalWrite(STEPPER_IN2, STEP_SEQ[stepIndex][1]);
-  digitalWrite(STEPPER_IN3, STEP_SEQ[stepIndex][2]);
-  digitalWrite(STEPPER_IN4, STEP_SEQ[stepIndex][3]);
-  stepPosition += direction;
-  delayMicroseconds(stepDelayUs);
-}
-
-static void stepperRelease() {
-  digitalWrite(STEPPER_IN1, 0); digitalWrite(STEPPER_IN2, 0);
-  digitalWrite(STEPPER_IN3, 0); digitalWrite(STEPPER_IN4, 0);
+static void servoWrite(uint8_t pin, float angleDeg) {
+  angleDeg = constrain(angleDeg, 0.0f, 180.0f);
+  float pulseUs = SERVO_MIN_US + (angleDeg / 180.0f) * (SERVO_MAX_US - SERVO_MIN_US);
+  uint32_t duty = (uint32_t)(pulseUs / SERVO_PERIOD_US * (float)((1u << SERVO_RESOLUTION) - 1));
+  ledcWrite(pin, duty);
 }
 
 // ─────────────────────────────────────────────
-// 9g servo — eyelid blink
-// Servo is attached once at boot and stays attached.
-// Between blinks it simply holds the open position — no write() calls,
-// no de-energize tricks. Just: open → closed → open, tunable via web UI.
+// 90g servo — pan rotation (thermal tracking)
 // ─────────────────────────────────────────────
-Servo blinkServo;
+static float rotateAngle   = 90.0f;
+static float rotateSpeed   = 1.0f;
+static const float ROTATE_MIN_DEG = 10.0f;
+static const float ROTATE_MAX_DEG = 170.0f;
+
+// ─────────────────────────────────────────────
+// 90g servo — eyelid blink
+// ─────────────────────────────────────────────
 
 static int           EYELID_OPEN_DEG   = 10;   // open/resting position
 static int           EYELID_CLOSED_DEG = 130;  // closed position (~120° swing)
@@ -80,10 +72,13 @@ enum BlinkPhase { BP_IDLE, BP_CLOSING, BP_CLOSED, BP_OPENING };
 static BlinkPhase    blinkPhase   = BP_IDLE;
 static unsigned long blinkPhaseMs = 0;
 static bool          triggerBlinkFlag = false;
+static int           blinkCount = 0;
 
 static void startBlink() {
   if (blinkPhase != BP_IDLE) return;
-  blinkServo.write(EYELID_CLOSED_DEG);
+  blinkCount++;
+  Serial.printf("[BLINK #%d]\n", blinkCount);
+  servoWrite(BLINK_SERVO_PIN, EYELID_CLOSED_DEG);
   blinkPhase   = BP_CLOSING;
   blinkPhaseMs = millis();
 }
@@ -108,7 +103,7 @@ static void updateBlink() {
 
     case BP_CLOSED:
       if (now - blinkPhaseMs >= blinkDurationMs) {
-        blinkServo.write(EYELID_OPEN_DEG);
+        servoWrite(BLINK_SERVO_PIN, EYELID_OPEN_DEG);
         blinkPhase   = BP_OPENING;
         blinkPhaseMs = now;
       }
@@ -218,34 +213,37 @@ static bool         trackFound      = false;
 static int          trackLostFrames = 0;
 bool                motorEnabled    = true;
 
-static const int MAX_STEPS_PER_UPDATE = 6;
-static const int SCAN_STEPS           = 2;
-static int       scanDirection        = 1;
-static const long SCAN_LIMIT          = 4096;
+static int scanDirection = 1;
 
 static const char *trackerStateName() {
   switch(trackerState){ case TS_TRACK: return "TRACK"; case TS_HOLD: return "HOLD"; default: return "SCAN"; }
 }
 
 static void doScan() {
-  for (int i=0;i<SCAN_STEPS;i++) stepperStep(scanDirection);
-  if (stepPosition >=  SCAN_LIMIT) scanDirection=-1;
-  if (stepPosition <= -SCAN_LIMIT) scanDirection= 1;
+  rotateAngle += rotateSpeed * scanDirection;
+  if (rotateAngle >= ROTATE_MAX_DEG) { rotateAngle = ROTATE_MAX_DEG; scanDirection = -1; }
+  if (rotateAngle <= ROTATE_MIN_DEG) { rotateAngle = ROTATE_MIN_DEG; scanDirection =  1; }
+  servoWrite(ROTATE_SERVO_PIN, rotateAngle);
 }
 
 static void doTrack(float targetX) {
-  const float centerX=(GRID_W-1)/2.0f;
-  float offset=(centerX-targetX)/centerX;
-  if (fabsf(offset)<0.10f){ stepperRelease(); return; }
-  int steps=constrain((int)(fabsf(offset)*MAX_STEPS_PER_UPDATE+0.5f),1,MAX_STEPS_PER_UPDATE);
-  int dir=(offset>0)?1:-1;
-  for (int i=0;i<steps;i++) stepperStep(dir);
+  const float centerX = (GRID_W - 1) / 2.0f;
+  float offset = (centerX - targetX) / centerX;  // −1 to +1
+  if (fabsf(offset) < 0.10f) return;
+  rotateAngle -= offset * rotateSpeed * 3.0f;
+  rotateAngle = constrain(rotateAngle, ROTATE_MIN_DEG, ROTATE_MAX_DEG);
+  servoWrite(ROTATE_SERVO_PIN, rotateAngle);
 }
 
 static void updateStepper(const float *pix, float ambientTemp) {
-  if (!motorEnabled){ stepperRelease(); return; }
+  if (!motorEnabled) return;
+  static unsigned long lastServoMs = 0;
+  unsigned long now = millis();
+  if (now - lastServoMs < 100) return;
+  lastServoMs = now;
   float blobX,blobY;
   bool blobFound=getPersonCentroid(pix,ambientTemp,&blobX,&blobY);
+  TrackerState prevState = trackerState;
   switch(trackerState){
     case TS_SCAN:
       if(blobFound){ trackTargetX=blobX; trackTargetY=blobY; trackFound=true; trackLostFrames=0; trackerState=TS_TRACK; doTrack(blobX); }
@@ -259,6 +257,14 @@ static void updateStepper(const float *pix, float ambientTemp) {
       if(blobFound){ trackTargetX=blobX; trackTargetY=blobY; trackFound=true; trackLostFrames=0; trackerState=TS_TRACK; doTrack(blobX); }
       else{ trackLostFrames++; if(trackLostFrames>10){trackerState=TS_SCAN;trackFound=false;}else{doTrack(trackTargetX);} }
       break;
+  }
+  if (trackerState != prevState) {
+    auto sname = [](TrackerState s){ return s==TS_TRACK?"TRACK":s==TS_HOLD?"HOLD":"SCAN"; };
+    Serial.printf("[TRACK] %s->%s blob=(%.1f,%.1f) angle=%.1f blinks=%d\n",
+      sname(prevState), sname(trackerState),
+      blobFound?blobX:-1.0f, blobFound?blobY:-1.0f,
+      rotateAngle, blinkCount);
+    Serial.flush();
   }
 }
 
@@ -392,9 +398,9 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
       </label>
       <button class="tog" id="blinkNowBtn">Blink Now</button>
 
-      <div class="group-title">Stepper Speed</div>
-      <label>Step delay (µs): <strong><span id="stepDelayVal">--</span></strong>
-        <input type="range" id="stepDelay" min="800" max="4000" step="100">
+      <div class="group-title">Rotate Servo</div>
+      <label>Scan speed (°/step): <strong><span id="rotateSpeedVal">--</span></strong>
+        <input type="range" id="rotateSpeed" min="0.5" max="10" step="0.5">
       </label>
 
       <div class="group-title">Status</div>
@@ -433,7 +439,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
     const slClosed   = bindSlider('closedAngle',  'closedVal',      'eyeClosed',     v=>v);
     const slInterval = bindSlider('blinkInterval','intervalVal',    'blinkInterval', v=>v);
     const slDuration = bindSlider('blinkDuration','durationVal',    'blinkDuration', v=>v);
-    const slDelay    = bindSlider('stepDelay',    'stepDelayVal',   'stepDelay',     v=>v);
+    const slRotSpd   = bindSlider('rotateSpeed',  'rotateSpeedVal', 'rotateSpeed',   v=>parseFloat(v).toFixed(1));
 
     document.getElementById('toggleManual').addEventListener('change', e=>{
       queue('useManualRange', e.target.checked);
@@ -532,7 +538,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
       if (document.activeElement!==slClosed)  { slClosed.value=d.eyeClosed;   document.getElementById('closedVal').textContent=d.eyeClosed; }
       if (document.activeElement!==slInterval){ slInterval.value=d.blinkInterval; document.getElementById('intervalVal').textContent=d.blinkInterval; }
       if (document.activeElement!==slDuration){ slDuration.value=d.blinkDuration; document.getElementById('durationVal').textContent=d.blinkDuration; }
-      if (document.activeElement!==slDelay)   { slDelay.value=d.stepDelay;    document.getElementById('stepDelayVal').textContent=d.stepDelay; }
+      if (document.activeElement!==slRotSpd)  { slRotSpd.value=d.rotateSpeed; document.getElementById('rotateSpeedVal').textContent=parseFloat(d.rotateSpeed).toFixed(1); }
       if (d.useManualRange!==undefined){ tm.checked=d.useManualRange; slMin.disabled=slMax.disabled=!d.useManualRange; }
       if (d.useInterpolation!==undefined) ti.checked=d.useInterpolation;
       if (d.displayMode!==undefined) modeBtns.forEach(b=>b.classList.toggle('active',parseInt(b.dataset.mode)===d.displayMode));
@@ -546,25 +552,35 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
     }
 
     function fetchFrame() {
-      fetch('/frame').then(r=>r.json()).then(d=>{
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 2500);
+      fetch('/frame', {signal: ctrl.signal}).then(r=>r.json()).then(d=>{
+        clearTimeout(timer);
         applySettings(d);
         if (d.ip) document.getElementById('ip-address').textContent=d.ip;
-        if (!d.frameReady) return;
-        drawHeatmap(d.pixels,d.tMin,d.tMax,d.useInterpolation,d.displayMode||0,d.median||0);
-        drawOverlay(d);
-        document.getElementById('stat-min').textContent=`${d.tMin.toFixed(1)}°`;
-        document.getElementById('stat-max').textContent=`${d.tMax.toFixed(1)}°`;
-        document.getElementById('stat-median').textContent=`${d.median.toFixed(1)}°`;
-        document.getElementById('target-pos').textContent=d.targetFound?`(${d.targetX.toFixed(1)}, ${d.targetY.toFixed(1)})`:'none';
-        stateEl.textContent=d.trackerState||'SCAN';
-        stateEl.className='state-badge '+(stateClass[d.trackerState]||'state-scan');
-        lastRx=Date.now();
-      }).catch(()=>{ lastRx=0; document.getElementById('last-frame').textContent='disconnected'; });
+        if (d.frameReady) {
+          d.pixels = d.pixels.slice().reverse();
+          d.targetX = (GRID - 1) - d.targetX;
+          d.targetY = (GRID - 1) - d.targetY;
+          drawHeatmap(d.pixels,d.tMin,d.tMax,d.useInterpolation,d.displayMode||0,d.median||0);
+          drawOverlay(d);
+          document.getElementById('stat-min').textContent=`${d.tMin.toFixed(1)}°`;
+          document.getElementById('stat-max').textContent=`${d.tMax.toFixed(1)}°`;
+          document.getElementById('stat-median').textContent=`${d.median.toFixed(1)}°`;
+          document.getElementById('target-pos').textContent=d.targetFound?`(${d.targetX.toFixed(1)}, ${d.targetY.toFixed(1)})`:'none';
+          stateEl.textContent=d.trackerState||'SCAN';
+          stateEl.className='state-badge '+(stateClass[d.trackerState]||'state-scan');
+          lastRx=Date.now();
+        }
+      }).catch(()=>{
+        clearTimeout(timer);
+        lastRx=0;
+        document.getElementById('last-frame').textContent='disconnected';
+      }).finally(()=>{ setTimeout(fetchFrame, 350); });
     }
 
     fetch('/settings').then(r=>r.json()).then(applySettings).catch(console.error);
     fetchFrame();
-    setInterval(fetchFrame,400);
     setInterval(updateAge,250);
   </script>
 </body>
@@ -596,7 +612,7 @@ static void handleFrame() {
   doc["eyeClosed"]       = EYELID_CLOSED_DEG;
   doc["blinkInterval"]   = (int)blinkIntervalMs;
   doc["blinkDuration"]   = (int)blinkDurationMs;
-  doc["stepDelay"]       = stepDelayUs;
+  doc["rotateSpeed"]     = rotateSpeed;
   doc["useInterpolation"]= useInterpolation;
   doc["useManualRange"]  = useManualRange;
   doc["manualMin"]       = manualMin;
@@ -622,7 +638,7 @@ static void handleSettingsGet() {
   doc["eyeClosed"]      = EYELID_CLOSED_DEG;
   doc["blinkInterval"]  = (int)blinkIntervalMs;
   doc["blinkDuration"]  = (int)blinkDurationMs;
-  doc["stepDelay"]      = stepDelayUs;
+  doc["rotateSpeed"]    = rotateSpeed;
   doc["useInterpolation"]= useInterpolation;
   doc["useManualRange"] = useManualRange;
   doc["manualMin"]      = manualMin;
@@ -640,14 +656,13 @@ static void handleSettingsPost() {
   if (!doc["eyeClosed"].isNull())      EYELID_CLOSED_DEG=doc["eyeClosed"].as<int>();
   if (!doc["blinkInterval"].isNull())  blinkIntervalMs = doc["blinkInterval"].as<unsigned long>();
   if (!doc["blinkDuration"].isNull())  blinkDurationMs = doc["blinkDuration"].as<unsigned long>();
-  if (!doc["stepDelay"].isNull())      stepDelayUs     = doc["stepDelay"].as<int>();
+  if (!doc["rotateSpeed"].isNull())    rotateSpeed     = doc["rotateSpeed"].as<float>();
   if (!doc["useInterpolation"].isNull()) useInterpolation=doc["useInterpolation"].as<bool>();
   if (!doc["useManualRange"].isNull()) { useManualRange=doc["useManualRange"].as<bool>(); autoRangeInitialized=false; }
   if (!doc["manualMin"].isNull())      manualMin       = doc["manualMin"].as<float>();
   if (!doc["manualMax"].isNull())      manualMax       = doc["manualMax"].as<float>();
   if (!doc["displayMode"].isNull())    displayMode     = (DisplayMode)doc["displayMode"].as<int>();
   if (!doc["triggerBlink"].isNull() && doc["triggerBlink"].as<bool>()) triggerBlinkFlag=true;
-  if (!motorEnabled) stepperRelease();
   handleSettingsGet();
 }
 
@@ -660,21 +675,25 @@ static void handleNotFound() {
 // ─────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  Serial.println("\nDoll Head Tracker v2 booting...");
+  delay(50);
+  const char* rr[] = {"","POWERON","","SW","OWDT","DEEPSLEEP","SDIO","TG0WDT","TG1WDT","RTCWDT","INTRUSION","TGWDT_CPU","SW_CPU","RTCWDT_CPU","EXT_CPU","BROWNOUT","RTCWDT_RTC"};
+  int rrc = (int)esp_reset_reason();
+  Serial.printf("\nReset: %s (%d)\n", (rrc<17?rr[rrc]:"?"), rrc);
+  Serial.println("Doll Head Tracker v2 booting..."); Serial.flush();
 
-  pinMode(STEPPER_IN1,OUTPUT); pinMode(STEPPER_IN2,OUTPUT);
-  pinMode(STEPPER_IN3,OUTPUT); pinMode(STEPPER_IN4,OUTPUT);
-  stepperRelease();
-
-  // Attach servo once at boot and hold open position
-  blinkServo.attach(BLINK_SERVO_PIN);
-  blinkServo.write(EYELID_OPEN_DEG);
+  Serial.println("Servo init..."); Serial.flush();
+  ledcAttach(ROTATE_SERVO_PIN, SERVO_FREQ, SERVO_RESOLUTION);
+  servoWrite(ROTATE_SERVO_PIN, rotateAngle);
+  ledcAttach(BLINK_SERVO_PIN, SERVO_FREQ, SERVO_RESOLUTION);
+  servoWrite(BLINK_SERVO_PIN, EYELID_OPEN_DEG);
+  Serial.println("Servos OK"); Serial.flush();
   delay(400);
-  blinkPhaseMs = millis(); // seed interval timer
+  blinkPhaseMs = millis();
 
+  Serial.println("Wire init..."); Serial.flush();
   Wire.begin(21,22);
-  if (!amg.begin()) Serial.println("ERROR: AMG8833 not found!");
-  else              Serial.println("AMG8833 OK");
+  if (!amg.begin()) { Serial.println("ERROR: AMG8833 not found!"); Serial.flush(); }
+  else              { Serial.println("AMG8833 OK"); Serial.flush(); }
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -698,43 +717,49 @@ void setup() {
 
   ArduinoOTA.setHostname("dollhead");
   if (strlen(OTA_PASSWORD)>0) ArduinoOTA.setPassword(OTA_PASSWORD);
-  ArduinoOTA.onStart([]()  { Serial.println("OTA start"); stepperRelease(); });
+  ArduinoOTA.onStart([]()  { Serial.println("OTA start"); });
   ArduinoOTA.onProgress([](unsigned int p,unsigned int t){ Serial.printf("OTA: %u%%\r",p*100/t); });
   ArduinoOTA.onEnd([]()    { Serial.println("\nOTA done"); });
   ArduinoOTA.onError([](ota_error_t e){ Serial.printf("OTA error[%u]\n",e); });
   ArduinoOTA.begin();
 
-  Serial.println("Ready.");
+  Serial.println("Ready."); Serial.flush();
 }
 
 // ─────────────────────────────────────────────
 // Loop
 // ─────────────────────────────────────────────
 void loop() {
+  static bool firstLoop = true;
+  if (firstLoop) { firstLoop = false; Serial.println("Loop start"); Serial.flush(); }
+
   ArduinoOTA.handle();
   server.handleClient();
-  if (WiFi.status()==WL_CONNECTED) deviceIp=WiFi.localIP().toString();
+  delay(5); // yield to FreeRTOS/WiFi background tasks — prevents watchdog reset
 
   if (triggerBlinkFlag){ triggerBlinkFlag=false; startBlink(); }
   updateBlink();
 
-  amg.readPixels(pixels);
-  float medianTemp=computeMedian(pixels,AMG88xx_PIXEL_ARRAY_SIZE);
+  static unsigned long lastAmgMs = 0;
+  unsigned long nowMs = millis();
+  if (nowMs - lastAmgMs >= 100) {
+    lastAmgMs = nowMs;
+    amg.readPixels(pixels);
+    float medianTemp=computeMedian(pixels,AMG88xx_PIXEL_ARRAY_SIZE);
+    updateStepper(pixels,medianTemp);
 
-  updateStepper(pixels,medianTemp);
+    float tMin,tMax;
+    if (useManualRange) {
+      tMin=manualMin; tMax=manualMax;
+    } else {
+      float mn=pixels[0],mx=pixels[0];
+      for (int i=1;i<AMG88xx_PIXEL_ARRAY_SIZE;i++){ if(pixels[i]<mn)mn=pixels[i]; if(pixels[i]>mx)mx=pixels[i]; }
+      applyRangeSmoothing(mn,mx,&tMin,&tMax);
+    }
 
-  // Compute display range
-  float tMin,tMax;
-  if (useManualRange) {
-    tMin=manualMin; tMax=manualMax;
-  } else {
-    float mn=pixels[0],mx=pixels[0];
-    for (int i=1;i<AMG88xx_PIXEL_ARRAY_SIZE;i++){ if(pixels[i]<mn)mn=pixels[i]; if(pixels[i]>mx)mx=pixels[i]; }
-    applyRangeSmoothing(mn,mx,&tMin,&tMax);
+    for (int i=0;i<AMG88xx_PIXEL_ARRAY_SIZE;i++) latestFrame[i]=pixels[i];
+    latestFrameMin=tMin; latestFrameMax=tMax;
+    latestFrameMedian=medianTemp; latestFrameMillis=millis();
+    frameAvailable=true;
   }
-
-  for (int i=0;i<AMG88xx_PIXEL_ARRAY_SIZE;i++) latestFrame[i]=pixels[i];
-  latestFrameMin=tMin; latestFrameMax=tMax;
-  latestFrameMedian=medianTemp; latestFrameMillis=millis();
-  frameAvailable=true;
 }
