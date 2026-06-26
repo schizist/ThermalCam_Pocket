@@ -74,6 +74,15 @@ static unsigned long blinkPhaseMs = 0;
 static bool          triggerBlinkFlag = false;
 static int           blinkCount = 0;
 
+static bool          debugMode              = false;
+static unsigned long normalBlinkIntervalMs  = 60000UL;  // 1 min default in normal mode
+static const unsigned long BLINK_NORMAL_MIN_MS = 30000UL;
+static const unsigned long BLINK_NORMAL_MAX_MS = 86400000UL;
+
+static bool          manualPanActive        = false;
+static unsigned long lastManualPanMs        = 0;
+static const unsigned long MANUAL_PAN_TIMEOUT_MS = 20000;
+
 static void startBlink() {
   if (blinkPhase != BP_IDLE) return;
   blinkCount++;
@@ -86,7 +95,8 @@ static void startBlink() {
 static void updateBlink() {
   unsigned long now = millis();
 
-  if (blinkPhase == BP_IDLE && (now - blinkPhaseMs >= blinkIntervalMs)) {
+  unsigned long activeBlinkInterval = debugMode ? blinkIntervalMs : normalBlinkIntervalMs;
+  if (blinkPhase == BP_IDLE && (now - blinkPhaseMs >= activeBlinkInterval)) {
     startBlink();
     return;
   }
@@ -237,6 +247,15 @@ static void doTrack(float targetX) {
 
 static void updateStepper(const float *pix, float ambientTemp) {
   if (!motorEnabled) return;
+  if (manualPanActive) {
+    if (millis() - lastManualPanMs >= MANUAL_PAN_TIMEOUT_MS) {
+      manualPanActive = false;
+      trackerState = TS_SCAN;
+      Serial.println("[PAN] Manual timeout — resuming auto");
+    } else {
+      return;
+    }
+  }
   static unsigned long lastServoMs = 0;
   unsigned long now = millis();
   if (now - lastServoMs < 100) return;
@@ -347,6 +366,12 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
                  padding:.35rem .75rem; cursor:pointer; font-size:.9rem; width:100%; margin-bottom:.5rem; }
     button.tog.on { background:#1a4a1a; border-color:#2c2; color:#4f4; font-weight:600; }
     .status { font-size:.9rem; opacity:.8; margin-bottom:.3rem; }
+    .pan-row { display:flex; align-items:center; gap:.75rem; margin:.5rem 0; }
+    .pan-btn { background:#2a2a2a; border:1px solid #444; border-radius:8px; color:#ccc;
+               font-size:1.4rem; padding:.4rem .9rem; cursor:pointer; flex:0 0 auto;
+               user-select:none; -webkit-user-select:none; touch-action:none; }
+    .pan-btn:active { background:#0a3a5a; border-color:#08f; }
+    .pan-info { flex:1; text-align:center; font-size:.9rem; color:#aaa; }
   </style>
 </head>
 <body>
@@ -382,19 +407,36 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
 
       <div class="group-title">Motor</div>
       <button class="tog on" id="motorBtn">Motor: ON</button>
+      <div class="pan-row">
+        <button class="pan-btn" id="panLeft">&#9664;</button>
+        <div class="pan-info"><span id="panAngle">--&deg;</span></div>
+        <button class="pan-btn" id="panRight">&#9654;</button>
+      </div>
+      <div id="panResumeRow" class="status" style="display:none">Auto resumes in <span id="panCountdown">20</span>s</div>
 
       <div class="group-title">Blink Servo</div>
-      <label>Open angle (°): <strong><span id="openVal">--</span></strong>
-        <input type="range" id="openAngle" min="0" max="180" step="1">
-      </label>
-      <label>Closed angle (°): <strong><span id="closedVal">--</span></strong>
-        <input type="range" id="closedAngle" min="0" max="180" step="1">
-      </label>
-      <label>Blink interval (ms): <strong><span id="intervalVal">--</span></strong>
-        <input type="range" id="blinkInterval" min="500" max="10000" step="100">
-      </label>
+      <div class="toggle-row">
+        <label><input type="checkbox" id="toggleDebug"> Debug blink mode</label>
+      </div>
+      <div id="normalBlinkSection">
+        <div class="status">Cooldown: <strong id="blinkCooldownDisplay">--</strong></div>
+        <label>Interval: <strong><span id="normalIntervalVal">--</span></strong>
+          <input type="range" id="normalBlinkInterval" min="0" max="100" step="1">
+        </label>
+      </div>
+      <div id="debugBlinkSection" style="display:none">
+        <label>Interval (ms): <strong><span id="intervalVal">--</span></strong>
+          <input type="range" id="blinkInterval" min="500" max="10000" step="100">
+        </label>
+      </div>
       <label>Blink duration (ms): <strong><span id="durationVal">--</span></strong>
         <input type="range" id="blinkDuration" min="50" max="500" step="10">
+      </label>
+      <label>Open angle (&deg;): <strong><span id="openVal">--</span></strong>
+        <input type="range" id="openAngle" min="0" max="180" step="1">
+      </label>
+      <label>Closed angle (&deg;): <strong><span id="closedVal">--</span></strong>
+        <input type="range" id="closedAngle" min="0" max="180" step="1">
       </label>
       <button class="tog" id="blinkNowBtn">Blink Now</button>
 
@@ -463,6 +505,52 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
     });
 
     document.getElementById('blinkNowBtn').addEventListener('click',()=>queue('triggerBlink',true));
+
+    // Log-scale normal blink interval (30s – 86400s)
+    const LOG_MIN = Math.log(30), LOG_MAX = Math.log(86400);
+    function sliderToSec(v) { return Math.round(Math.exp(LOG_MIN + (v/100)*(LOG_MAX-LOG_MIN))); }
+    function secToSlider(s) { return Math.round(((Math.log(Math.max(30,Math.min(86400,s)))-LOG_MIN)/(LOG_MAX-LOG_MIN))*100); }
+    function fmtSec(s) {
+      if (s<60) return `${s}s`;
+      const m=Math.floor(s/60),r=s%60;
+      if (s<3600) return r?`${m}m ${r}s`:`${m}m`;
+      const h=Math.floor(s/3600),hm=Math.floor((s%3600)/60);
+      if (s<86400) return hm?`${h}hr ${hm}m`:`${h}hr`;
+      return '24hr';
+    }
+    const slNormal = document.getElementById('normalBlinkInterval');
+    slNormal.addEventListener('input', ()=>{
+      const secs=sliderToSec(slNormal.value);
+      document.getElementById('normalIntervalVal').textContent=fmtSec(secs);
+      document.getElementById('blinkCooldownDisplay').textContent=fmtSec(secs);
+      queue('normalBlinkInterval', secs*1000);
+    });
+
+    // Debug mode toggle
+    let isDebugMode = false;
+    document.getElementById('toggleDebug').addEventListener('change', e=>{
+      isDebugMode=e.target.checked;
+      document.getElementById('debugBlinkSection').style.display=isDebugMode?'':'none';
+      document.getElementById('normalBlinkSection').style.display=isDebugMode?'none':'';
+      queue('debugMode', isDebugMode);
+    });
+
+    // Pan buttons — hold to pan continuously
+    let panTimer = null;
+    function doPan(dir) {
+      fetch('/settings',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify(dir<0?{panLeft:true}:{panRight:true})}).catch(console.error);
+    }
+    function startPan(dir) { doPan(dir); panTimer=setInterval(()=>doPan(dir),150); }
+    function stopPan() { if(panTimer){clearInterval(panTimer);panTimer=null;} }
+    const panLeftBtn  = document.getElementById('panLeft');
+    const panRightBtn = document.getElementById('panRight');
+    panLeftBtn.addEventListener('mousedown',  e=>{e.preventDefault();startPan(-1);});
+    panRightBtn.addEventListener('mousedown', e=>{e.preventDefault();startPan(1);});
+    panLeftBtn.addEventListener('touchstart',  e=>{e.preventDefault();startPan(-1);},{passive:false});
+    panRightBtn.addEventListener('touchstart', e=>{e.preventDefault();startPan(1); },{passive:false});
+    document.addEventListener('mouseup',  stopPan);
+    document.addEventListener('touchend', stopPan);
 
     function thermalColor(r) {
       r=Math.max(0,Math.min(1,r));
@@ -543,6 +631,22 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
       if (d.useInterpolation!==undefined) ti.checked=d.useInterpolation;
       if (d.displayMode!==undefined) modeBtns.forEach(b=>b.classList.toggle('active',parseInt(b.dataset.mode)===d.displayMode));
       if (d.motorEnabled!==undefined){ motorOn=d.motorEnabled; motorBtn.textContent=motorOn?'Motor: ON':'Motor: OFF'; motorBtn.classList.toggle('on',motorOn); }
+      if (d.debugMode!==undefined && d.debugMode!==isDebugMode) {
+        isDebugMode=d.debugMode;
+        document.getElementById('toggleDebug').checked=isDebugMode;
+        document.getElementById('debugBlinkSection').style.display=isDebugMode?'':'none';
+        document.getElementById('normalBlinkSection').style.display=isDebugMode?'none':'';
+      }
+      if (d.normalBlinkInterval!==undefined && document.activeElement!==slNormal) {
+        const secs=Math.round(d.normalBlinkInterval/1000);
+        slNormal.value=secToSlider(secs);
+        document.getElementById('normalIntervalVal').textContent=fmtSec(secs);
+        document.getElementById('blinkCooldownDisplay').textContent=fmtSec(secs);
+      }
+      if (d.rotateAngle!==undefined) document.getElementById('panAngle').textContent=Math.round(d.rotateAngle)+'°';
+      const panRow=document.getElementById('panResumeRow');
+      if (d.manualPanActive) { panRow.style.display=''; document.getElementById('panCountdown').textContent=Math.max(0,d.manualPanRemainSec||0); }
+      else panRow.style.display='none';
     }
 
     function updateAge() {
@@ -607,10 +711,15 @@ static void handleFrame() {
   doc["targetX"]         = trackTargetX;
   doc["targetY"]         = trackTargetY;
   doc["trackerState"]    = trackerStateName();
-  doc["motorEnabled"]    = motorEnabled;
-  doc["eyeOpen"]         = EYELID_OPEN_DEG;
-  doc["eyeClosed"]       = EYELID_CLOSED_DEG;
-  doc["blinkInterval"]   = (int)blinkIntervalMs;
+  doc["motorEnabled"]         = motorEnabled;
+  doc["debugMode"]            = debugMode;
+  doc["normalBlinkInterval"]  = (long)normalBlinkIntervalMs;
+  doc["manualPanActive"]      = manualPanActive;
+  doc["manualPanRemainSec"]   = manualPanActive ? (int)((MANUAL_PAN_TIMEOUT_MS - (millis() - lastManualPanMs)) / 1000) : 0;
+  doc["rotateAngle"]          = rotateAngle;
+  doc["eyeOpen"]              = EYELID_OPEN_DEG;
+  doc["eyeClosed"]            = EYELID_CLOSED_DEG;
+  doc["blinkInterval"]        = (int)blinkIntervalMs;
   doc["blinkDuration"]   = (int)blinkDurationMs;
   doc["rotateSpeed"]     = rotateSpeed;
   doc["useInterpolation"]= useInterpolation;
@@ -633,10 +742,15 @@ static void handleFrame() {
 static void handleSettingsGet() {
   JsonDocument doc;
   doc["ip"]             = deviceIp;
-  doc["motorEnabled"]   = motorEnabled;
-  doc["eyeOpen"]        = EYELID_OPEN_DEG;
-  doc["eyeClosed"]      = EYELID_CLOSED_DEG;
-  doc["blinkInterval"]  = (int)blinkIntervalMs;
+  doc["motorEnabled"]        = motorEnabled;
+  doc["debugMode"]           = debugMode;
+  doc["normalBlinkInterval"] = (long)normalBlinkIntervalMs;
+  doc["manualPanActive"]     = manualPanActive;
+  doc["manualPanRemainSec"]  = manualPanActive ? (int)((MANUAL_PAN_TIMEOUT_MS - (millis() - lastManualPanMs)) / 1000) : 0;
+  doc["rotateAngle"]         = rotateAngle;
+  doc["eyeOpen"]             = EYELID_OPEN_DEG;
+  doc["eyeClosed"]           = EYELID_CLOSED_DEG;
+  doc["blinkInterval"]       = (int)blinkIntervalMs;
   doc["blinkDuration"]  = (int)blinkDurationMs;
   doc["rotateSpeed"]    = rotateSpeed;
   doc["useInterpolation"]= useInterpolation;
@@ -663,6 +777,23 @@ static void handleSettingsPost() {
   if (!doc["manualMax"].isNull())      manualMax       = doc["manualMax"].as<float>();
   if (!doc["displayMode"].isNull())    displayMode     = (DisplayMode)doc["displayMode"].as<int>();
   if (!doc["triggerBlink"].isNull() && doc["triggerBlink"].as<bool>()) triggerBlinkFlag=true;
+  if (!doc["debugMode"].isNull()) debugMode = doc["debugMode"].as<bool>();
+  if (!doc["normalBlinkInterval"].isNull()) {
+    unsigned long v = doc["normalBlinkInterval"].as<unsigned long>();
+    normalBlinkIntervalMs = constrain(v, BLINK_NORMAL_MIN_MS, BLINK_NORMAL_MAX_MS);
+  }
+  if (!doc["panLeft"].isNull() && doc["panLeft"].as<bool>()) {
+    rotateAngle = constrain(rotateAngle - rotateSpeed * 3.0f, ROTATE_MIN_DEG, ROTATE_MAX_DEG);
+    servoWrite(ROTATE_SERVO_PIN, rotateAngle);
+    manualPanActive = true;
+    lastManualPanMs = millis();
+  }
+  if (!doc["panRight"].isNull() && doc["panRight"].as<bool>()) {
+    rotateAngle = constrain(rotateAngle + rotateSpeed * 3.0f, ROTATE_MIN_DEG, ROTATE_MAX_DEG);
+    servoWrite(ROTATE_SERVO_PIN, rotateAngle);
+    manualPanActive = true;
+    lastManualPanMs = millis();
+  }
   handleSettingsGet();
 }
 
