@@ -38,8 +38,8 @@
 // ─────────────────────────────────────────────
 static const uint32_t SERVO_FREQ       = 50;
 static const uint8_t  SERVO_RESOLUTION = 16;
-static const float    SERVO_MIN_US     = 1000.0f;
-static const float    SERVO_MAX_US     = 2000.0f;
+static const float    SERVO_MIN_US     = 500.0f;
+static const float    SERVO_MAX_US     = 2500.0f;
 static const float    SERVO_PERIOD_US  = 20000.0f;
 
 static void servoWrite(uint8_t pin, float angleDeg) {
@@ -62,7 +62,7 @@ static const float ROTATE_MAX_DEG = 170.0f;
 // ─────────────────────────────────────────────
 
 static int           EYELID_OPEN_DEG   = 10;   // open/resting position
-static int           EYELID_CLOSED_DEG = 130;  // closed position (~120° swing)
+static int           EYELID_CLOSED_DEG = 60;  // closed position (~120° swing)
 static unsigned long blinkIntervalMs   = 4000; // ms between blinks
 static unsigned long blinkDurationMs   = 150;  // ms lid stays closed
 // Time to allow servo to physically travel before advancing state
