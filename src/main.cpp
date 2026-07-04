@@ -54,19 +54,19 @@ static void servoWrite(uint8_t pin, float angleDeg) {
 // ─────────────────────────────────────────────
 static float rotateAngle   = 90.0f;
 static float rotateSpeed   = 1.0f;
-static const float ROTATE_MIN_DEG = 10.0f;
-static const float ROTATE_MAX_DEG = 170.0f;
+static const float ROTATE_MIN_DEG =21.0f; // min alowed by frame geometry
+static const float ROTATE_MAX_DEG = 165.0f; // max allowed by frame geometry
 
 // ─────────────────────────────────────────────
 // 90g servo — eyelid blink
 // ─────────────────────────────────────────────
 
-static int           EYELID_OPEN_DEG   = 10;   // open/resting position
-static int           EYELID_CLOSED_DEG = 45;  // closed position (~120° swing)
+static int           EYELID_OPEN_DEG   = 60;   // open/resting position
+static int           EYELID_CLOSED_DEG = 86;  // closed position
 static unsigned long blinkIntervalMs   = 4000; // ms between blinks
 static unsigned long blinkDurationMs   = 150;  // ms lid stays closed
 // Time to allow servo to physically travel before advancing state
-static const unsigned long SERVO_SETTLE_MS = 400;
+static const unsigned long SERVO_SETTLE_MS = 200;
 
 enum BlinkPhase { BP_IDLE, BP_CLOSING, BP_CLOSED, BP_OPENING };
 static BlinkPhase    blinkPhase   = BP_IDLE;
