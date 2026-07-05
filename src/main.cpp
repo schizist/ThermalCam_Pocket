@@ -1,8 +1,8 @@
 // Doll Head Thermal Tracker v2
 // 90g servo on GPIO13 for pan rotation (thermal tracking)
 // 90g servo on GPIO32 for eyelid blink
-// AMG8833 on I2C GPIO21/22
-// WiFi + OTA + web UI with interpolation and display modes
+// AMG8833 on I2C GPIO21/22  |  LD2410C radar on UART2 GPIO16(RX)/GPIO17(TX)
+// WiFi + OTA + web UI — switchable between AMG8833 thermal and LD2410C radar sensors
 
 #include <Arduino.h>
 #include <Wire.h>
@@ -11,6 +11,7 @@
 #include <ESPmDNS.h>
 #include <ArduinoJson.h>
 #include <Adafruit_AMG88xx.h>
+#include <ld2410.h>
 #include <ArduinoOTA.h>
 #include <algorithm>
 #include <cmath>
@@ -139,6 +140,21 @@ float pixels[AMG88xx_PIXEL_ARRAY_SIZE];
 
 static const float HUMAN_ABOVE_MIN = 1.5f;
 static const float HUMAN_ABOVE_MAX = 12.0f;
+
+// ─────────────────────────────────────────────
+// Sensor mode + LD2410C radar
+// ─────────────────────────────────────────────
+enum SensorMode { SENSOR_AMG = 0, SENSOR_RADAR = 1 };
+static SensorMode sensorMode = SENSOR_AMG;
+
+ld2410 radar;
+static bool     radarPresence   = false;
+static bool     radarMoving     = false;
+static bool     radarStationary = false;
+static uint16_t radarMovDist    = 0;
+static uint16_t radarStatDist   = 0;
+static uint8_t  radarMovEnergy  = 0;
+static uint8_t  radarStatEnergy = 0;
 
 // ─────────────────────────────────────────────
 // Display / range settings (for web UI)
@@ -288,6 +304,44 @@ static void updateStepper(const float *pix, float ambientTemp) {
 }
 
 // ─────────────────────────────────────────────
+// LD2410C tracker — presence in/out drives SCAN ↔ HOLD (no angle data)
+// ─────────────────────────────────────────────
+static void updateStepperRadar() {
+  if (!motorEnabled) return;
+  if (manualPanActive) {
+    if (millis() - lastManualPanMs >= MANUAL_PAN_TIMEOUT_MS) {
+      manualPanActive = false;
+      trackerState = TS_SCAN;
+      Serial.println("[PAN] Manual timeout — resuming auto");
+    } else {
+      return;
+    }
+  }
+  static unsigned long lastRadarMs = 0;
+  unsigned long now = millis();
+  if (now - lastRadarMs < 200) return;
+  lastRadarMs = now;
+
+  TrackerState prevState = trackerState;
+  if (radarPresence) {
+    trackFound = true;
+    trackLostFrames = 0;
+    if (trackerState == TS_SCAN) trackerState = TS_HOLD;
+  } else {
+    trackFound = false;
+    trackLostFrames++;
+    if (trackerState == TS_HOLD && trackLostFrames > 5) trackerState = TS_SCAN;
+    if (trackerState == TS_SCAN) doScan();
+  }
+  if (trackerState != prevState) {
+    auto sname = [](TrackerState s){ return s==TS_TRACK?"TRACK":s==TS_HOLD?"HOLD":"SCAN"; };
+    Serial.printf("[RADAR] %s->%s presence=%d angle=%.1f\n",
+      sname(prevState), sname(trackerState), radarPresence, rotateAngle);
+    Serial.flush();
+  }
+}
+
+// ─────────────────────────────────────────────
 // Stats + interpolation
 // ─────────────────────────────────────────────
 static float computeMedian(float *arr, int n) {
@@ -366,6 +420,10 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
                  padding:.35rem .75rem; cursor:pointer; font-size:.9rem; width:100%; margin-bottom:.5rem; }
     button.tog.on { background:#1a4a1a; border-color:#2c2; color:#4f4; font-weight:600; }
     .status { font-size:.9rem; opacity:.8; margin-bottom:.3rem; }
+    .sensor-row { display:flex; gap:.5rem; margin-bottom:1rem; }
+    .sensor-btn { flex:1; background:#2a2a2a; border:1px solid #444; border-radius:6px; color:#ccc;
+                  padding:.4rem .5rem; cursor:pointer; font-size:.85rem; font-weight:600; }
+    .sensor-btn.active { background:#1a3a4a; border-color:#08f; color:#6cf; }
     .pan-row { display:flex; align-items:center; gap:.75rem; margin:.5rem 0; }
     .pan-btn { background:#2a2a2a; border:1px solid #444; border-radius:8px; color:#ccc;
                font-size:1.4rem; padding:.4rem .9rem; cursor:pointer; flex:0 0 auto;
@@ -381,28 +439,33 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
       <canvas id="heatmap" width="320" height="320"></canvas>
     </div>
     <div class="panel">
+      <div class="sensor-row">
+        <button class="sensor-btn active" id="btnAmg">AMG8833</button>
+        <button class="sensor-btn" id="btnRadar">LD2410C</button>
+      </div>
       <div class="stats">
-        <div class="stat">Min<span id="stat-min">--</span></div>
-        <div class="stat">Median<span id="stat-median">--</span></div>
-        <div class="stat">Max<span id="stat-max">--</span></div>
+        <div class="stat"><span id="lbl-stat0">Min</span><span id="stat-min">--</span></div>
+        <div class="stat"><span id="lbl-stat1">Median</span><span id="stat-median">--</span></div>
+        <div class="stat"><span id="lbl-stat2">Max</span><span id="stat-max">--</span></div>
       </div>
 
-      <div class="toggle-row">
-        <label><input type="checkbox" id="toggleManual"> Manual range</label>
-        <label><input type="checkbox" id="toggleInterp" checked> Interpolation</label>
-      </div>
-      <label>Manual min: <strong><span id="sliderMinValue">--</span> °C</strong>
-        <input type="range" id="sliderMin" min="-20" max="120" step="0.1">
-      </label>
-      <label>Manual max: <strong><span id="sliderMaxValue">--</span> °C</strong>
-        <input type="range" id="sliderMax" min="-20" max="120" step="0.1">
-      </label>
-
-      <div class="group-title">Display Mode</div>
-      <div class="toggle-row">
-        <button class="mode-btn" data-mode="0">Thermal</button>
-        <button class="mode-btn" data-mode="1">Gray</button>
-        <button class="mode-btn active" data-mode="2">Person</button>
+      <div id="amgControls">
+        <div class="toggle-row">
+          <label><input type="checkbox" id="toggleManual"> Manual range</label>
+          <label><input type="checkbox" id="toggleInterp" checked> Interpolation</label>
+        </div>
+        <label>Manual min: <strong><span id="sliderMinValue">--</span> °C</strong>
+          <input type="range" id="sliderMin" min="-20" max="120" step="0.1">
+        </label>
+        <label>Manual max: <strong><span id="sliderMaxValue">--</span> °C</strong>
+          <input type="range" id="sliderMax" min="-20" max="120" step="0.1">
+        </label>
+        <div class="group-title">Display Mode</div>
+        <div class="toggle-row">
+          <button class="mode-btn" data-mode="0">Thermal</button>
+          <button class="mode-btn" data-mode="1">Gray</button>
+          <button class="mode-btn active" data-mode="2">Person</button>
+        </div>
       </div>
 
       <div class="group-title">Motor</div>
@@ -614,8 +677,67 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
       ctx.beginPath(); ctx.moveTo(cx,cy-r*1.6); ctx.lineTo(cx,cy+r*1.6); ctx.stroke();
     }
 
+    function drawRadar(d) {
+      const W=320,H=320,cx=W/2,cy=H*0.86,maxR=H*0.80,maxDist=800;
+      ctx.fillStyle='#040c04'; ctx.fillRect(0,0,W,H);
+      // Clipped range arcs (upper half only)
+      ctx.save(); ctx.beginPath(); ctx.rect(0,0,W,cy+1); ctx.clip();
+      for(let i=1;i<=4;i++){
+        const r=(i/4)*maxR;
+        ctx.beginPath(); ctx.arc(cx,cy,r,0,2*Math.PI);
+        ctx.strokeStyle=`rgba(0,180,60,${0.08+i*0.05})`; ctx.lineWidth=1; ctx.stroke();
+        ctx.fillStyle='rgba(0,180,60,0.4)'; ctx.font='10px monospace'; ctx.textAlign='left';
+        ctx.fillText(`${Math.round(maxDist*i/4/50)*50}cm`,cx+r+3,cy-3);
+      }
+      for(let a=0;a<=180;a+=30){
+        const rad=(180-a)*Math.PI/180;
+        ctx.strokeStyle='rgba(0,180,60,0.12)'; ctx.lineWidth=1;
+        ctx.beginPath(); ctx.moveTo(cx,cy);
+        ctx.lineTo(cx+Math.cos(rad)*maxR, cy+Math.sin(rad)*maxR); ctx.stroke();
+      }
+      ctx.restore();
+      // Targets
+      const both=d.radarMoving&&d.radarStationary;
+      function drawTarget(distCm,offX,col,r){
+        if(!distCm) return;
+        const nr=Math.min(distCm/maxDist,0.97)*maxR;
+        const x=cx+offX, y=cy-nr; if(y<4) return;
+        const g=ctx.createRadialGradient(x,y,0,x,y,r*4);
+        g.addColorStop(0,col); g.addColorStop(1,'rgba(0,0,0,0)');
+        ctx.fillStyle=g; ctx.beginPath(); ctx.arc(x,y,r*4,0,2*Math.PI); ctx.fill();
+        ctx.fillStyle=col; ctx.beginPath(); ctx.arc(x,y,r,0,2*Math.PI); ctx.fill();
+      }
+      if(d.radarStationary&&d.radarStatDist) drawTarget(d.radarStatDist, both?12:0, '#00e060', 6);
+      if(d.radarMoving&&d.radarMovDist)      drawTarget(d.radarMovDist,  both?-12:0, '#ff6020', 8);
+      // Sensor dot
+      ctx.fillStyle='rgba(0,180,60,0.8)'; ctx.beginPath(); ctx.arc(cx,cy,5,0,2*Math.PI); ctx.fill();
+      // Status line
+      ctx.textAlign='center'; ctx.font='bold 13px monospace';
+      let txt='NO PRESENCE', col='rgba(0,180,60,0.5)';
+      if(d.radarMoving&&d.radarMovDist){txt='MOVING  '+d.radarMovDist+'cm'; col='#ff8040';}
+      else if(d.radarStationary&&d.radarStatDist){txt='STATIC  '+d.radarStatDist+'cm'; col='#40ff80';}
+      else if(d.radarPresence){txt='PRESENCE'; col='#ffffff';}
+      ctx.fillStyle=col; ctx.fillText(txt,cx,18);
+    }
+
     const stateEl=document.getElementById('tracker-state');
     const stateClass={TRACK:'state-track',HOLD:'state-hold',SCAN:'state-scan'};
+
+    // Sensor mode toggle
+    let curSensorMode = 0;
+    const RADAR_STAT_LABELS = ['Moving','Presence','Static'];
+    const AMG_STAT_LABELS   = ['Min','Median','Max'];
+    function applySensorMode(mode) {
+      curSensorMode = mode;
+      const isRadar = mode===1;
+      document.getElementById('btnAmg').classList.toggle('active',!isRadar);
+      document.getElementById('btnRadar').classList.toggle('active', isRadar);
+      document.getElementById('amgControls').style.display = isRadar ? 'none' : '';
+      const lbls = isRadar ? RADAR_STAT_LABELS : AMG_STAT_LABELS;
+      ['lbl-stat0','lbl-stat1','lbl-stat2'].forEach((id,i)=>document.getElementById(id).textContent=lbls[i]);
+    }
+    document.getElementById('btnAmg').addEventListener('click',   ()=>{ queue('sensorMode',0); applySensorMode(0); });
+    document.getElementById('btnRadar').addEventListener('click',  ()=>{ queue('sensorMode',1); applySensorMode(1); });
 
     function applySettings(d) {
       const tm=document.getElementById('toggleManual');
@@ -631,6 +753,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
       if (d.useInterpolation!==undefined) ti.checked=d.useInterpolation;
       if (d.displayMode!==undefined) modeBtns.forEach(b=>b.classList.toggle('active',parseInt(b.dataset.mode)===d.displayMode));
       if (d.motorEnabled!==undefined){ motorOn=d.motorEnabled; motorBtn.textContent=motorOn?'Motor: ON':'Motor: OFF'; motorBtn.classList.toggle('on',motorOn); }
+      if (d.sensorMode!==undefined && d.sensorMode!==curSensorMode) applySensorMode(d.sensorMode);
       if (d.debugMode!==undefined && d.debugMode!==isDebugMode) {
         isDebugMode=d.debugMode;
         document.getElementById('toggleDebug').checked=isDebugMode;
@@ -662,7 +785,16 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
         clearTimeout(timer);
         applySettings(d);
         if (d.ip) document.getElementById('ip-address').textContent=d.ip;
-        if (d.frameReady) {
+        if (d.sensorMode===1) {
+          drawRadar(d);
+          document.getElementById('stat-min').textContent    = d.radarMoving     ? d.radarMovDist+'cm'  : '--';
+          document.getElementById('stat-median').textContent = d.radarPresence   ? (d.radarMoving?'MOV':d.radarStationary?'STA':'YES') : 'NONE';
+          document.getElementById('stat-max').textContent    = d.radarStationary ? d.radarStatDist+'cm' : '--';
+          document.getElementById('target-pos').textContent  = d.radarPresence   ? (d.radarMoving?'moving':'static') : 'none';
+          stateEl.textContent=d.trackerState||'SCAN';
+          stateEl.className='state-badge '+(stateClass[d.trackerState]||'state-scan');
+          lastRx=Date.now();
+        } else if (d.frameReady) {
           d.pixels = d.pixels.slice().reverse();
           d.targetX = (GRID - 1) - d.targetX;
           d.targetY = (GRID - 1) - d.targetY;
@@ -711,6 +843,7 @@ static void handleFrame() {
   doc["targetX"]         = trackTargetX;
   doc["targetY"]         = trackTargetY;
   doc["trackerState"]    = trackerStateName();
+  doc["sensorMode"]           = (int)sensorMode;
   doc["motorEnabled"]         = motorEnabled;
   doc["debugMode"]            = debugMode;
   doc["normalBlinkInterval"]  = (long)normalBlinkIntervalMs;
@@ -720,20 +853,27 @@ static void handleFrame() {
   doc["eyeOpen"]              = EYELID_OPEN_DEG;
   doc["eyeClosed"]            = EYELID_CLOSED_DEG;
   doc["blinkInterval"]        = (int)blinkIntervalMs;
-  doc["blinkDuration"]   = (int)blinkDurationMs;
-  doc["rotateSpeed"]     = rotateSpeed;
-  doc["useInterpolation"]= useInterpolation;
-  doc["useManualRange"]  = useManualRange;
-  doc["manualMin"]       = manualMin;
-  doc["manualMax"]       = manualMax;
-  doc["displayMode"]     = (int)displayMode;
-  if (frameAvailable) {
+  doc["blinkDuration"]        = (int)blinkDurationMs;
+  doc["rotateSpeed"]          = rotateSpeed;
+  doc["useInterpolation"]     = useInterpolation;
+  doc["useManualRange"]       = useManualRange;
+  doc["manualMin"]            = manualMin;
+  doc["manualMax"]            = manualMax;
+  doc["displayMode"]          = (int)displayMode;
+  doc["radarPresence"]        = radarPresence;
+  doc["radarMoving"]          = radarMoving;
+  doc["radarStationary"]      = radarStationary;
+  doc["radarMovDist"]         = radarMovDist;
+  doc["radarStatDist"]        = radarStatDist;
+  doc["radarMovEnergy"]       = radarMovEnergy;
+  doc["radarStatEnergy"]      = radarStatEnergy;
+  if (sensorMode == SENSOR_AMG && frameAvailable) {
     doc["timestamp"]=latestFrameMillis;
     doc["tMin"]=latestFrameMin; doc["tMax"]=latestFrameMax; doc["median"]=latestFrameMedian;
     JsonArray arr=doc["pixels"].to<JsonArray>();
     for (int i=0;i<AMG88xx_PIXEL_ARRAY_SIZE;i++) arr.add(latestFrame[i]);
   } else {
-    doc["timestamp"]=0; doc["tMin"]=18; doc["tMax"]=35; doc["median"]=22;
+    doc["timestamp"]=0; doc["tMin"]=0; doc["tMax"]=0; doc["median"]=0;
     doc["pixels"].to<JsonArray>();
   }
   sendJson(doc);
@@ -742,6 +882,7 @@ static void handleFrame() {
 static void handleSettingsGet() {
   JsonDocument doc;
   doc["ip"]             = deviceIp;
+  doc["sensorMode"]          = (int)sensorMode;
   doc["motorEnabled"]        = motorEnabled;
   doc["debugMode"]           = debugMode;
   doc["normalBlinkInterval"] = (long)normalBlinkIntervalMs;
@@ -751,13 +892,13 @@ static void handleSettingsGet() {
   doc["eyeOpen"]             = EYELID_OPEN_DEG;
   doc["eyeClosed"]           = EYELID_CLOSED_DEG;
   doc["blinkInterval"]       = (int)blinkIntervalMs;
-  doc["blinkDuration"]  = (int)blinkDurationMs;
-  doc["rotateSpeed"]    = rotateSpeed;
-  doc["useInterpolation"]= useInterpolation;
-  doc["useManualRange"] = useManualRange;
-  doc["manualMin"]      = manualMin;
-  doc["manualMax"]      = manualMax;
-  doc["displayMode"]    = (int)displayMode;
+  doc["blinkDuration"]       = (int)blinkDurationMs;
+  doc["rotateSpeed"]         = rotateSpeed;
+  doc["useInterpolation"]    = useInterpolation;
+  doc["useManualRange"]      = useManualRange;
+  doc["manualMin"]           = manualMin;
+  doc["manualMax"]           = manualMax;
+  doc["displayMode"]         = (int)displayMode;
   sendJson(doc);
 }
 
@@ -777,6 +918,11 @@ static void handleSettingsPost() {
   if (!doc["manualMax"].isNull())      manualMax       = doc["manualMax"].as<float>();
   if (!doc["displayMode"].isNull())    displayMode     = (DisplayMode)doc["displayMode"].as<int>();
   if (!doc["triggerBlink"].isNull() && doc["triggerBlink"].as<bool>()) triggerBlinkFlag=true;
+  if (!doc["sensorMode"].isNull()) {
+    sensorMode = (SensorMode)doc["sensorMode"].as<int>();
+    trackerState = TS_SCAN;  // reset tracker when switching sensors
+    trackFound = false;
+  }
   if (!doc["debugMode"].isNull()) debugMode = doc["debugMode"].as<bool>();
   if (!doc["normalBlinkInterval"].isNull()) {
     unsigned long v = doc["normalBlinkInterval"].as<unsigned long>();
@@ -823,8 +969,14 @@ void setup() {
 
   Serial.println("Wire init..."); Serial.flush();
   Wire.begin(21,22);
-  if (!amg.begin()) { Serial.println("ERROR: AMG8833 not found!"); Serial.flush(); }
+  if (!amg.begin()) { Serial.println("WARN: AMG8833 not found"); Serial.flush(); }
   else              { Serial.println("AMG8833 OK"); Serial.flush(); }
+
+  Serial.println("LD2410C init (UART2 RX=16 TX=17)..."); Serial.flush();
+  Serial2.begin(256000, SERIAL_8N1, 16, 17);
+  if (radar.begin(Serial2, false)) { Serial.println("LD2410C OK"); }
+  else                             { Serial.println("WARN: LD2410C not found"); }
+  Serial.flush();
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -871,26 +1023,43 @@ void loop() {
   if (triggerBlinkFlag){ triggerBlinkFlag=false; startBlink(); }
   updateBlink();
 
+  // LD2410C — non-blocking poll every loop iteration
+  if (radar.read()) {
+    radarPresence   = radar.presenceDetected();
+    radarMoving     = radar.movingTargetDetected();
+    radarStationary = radar.stationaryTargetDetected();
+    radarMovDist    = radarMoving     ? radar.movingTargetDistance()    : 0;
+    radarStatDist   = radarStationary ? radar.stationaryTargetDistance(): 0;
+    radarMovEnergy  = radarMoving     ? radar.movingTargetEnergy()      : 0;
+    radarStatEnergy = radarStationary ? radar.stationaryTargetEnergy()  : 0;
+  }
+
   static unsigned long lastAmgMs = 0;
   unsigned long nowMs = millis();
-  if (nowMs - lastAmgMs >= 100) {
-    lastAmgMs = nowMs;
-    amg.readPixels(pixels);
-    float medianTemp=computeMedian(pixels,AMG88xx_PIXEL_ARRAY_SIZE);
-    updateStepper(pixels,medianTemp);
 
-    float tMin,tMax;
-    if (useManualRange) {
-      tMin=manualMin; tMax=manualMax;
-    } else {
-      float mn=pixels[0],mx=pixels[0];
-      for (int i=1;i<AMG88xx_PIXEL_ARRAY_SIZE;i++){ if(pixels[i]<mn)mn=pixels[i]; if(pixels[i]>mx)mx=pixels[i]; }
-      applyRangeSmoothing(mn,mx,&tMin,&tMax);
+  if (sensorMode == SENSOR_RADAR) {
+    updateStepperRadar();
+    frameAvailable = true;
+  } else {
+    if (nowMs - lastAmgMs >= 100) {
+      lastAmgMs = nowMs;
+      amg.readPixels(pixels);
+      float medianTemp=computeMedian(pixels,AMG88xx_PIXEL_ARRAY_SIZE);
+      updateStepper(pixels,medianTemp);
+
+      float tMin,tMax;
+      if (useManualRange) {
+        tMin=manualMin; tMax=manualMax;
+      } else {
+        float mn=pixels[0],mx=pixels[0];
+        for (int i=1;i<AMG88xx_PIXEL_ARRAY_SIZE;i++){ if(pixels[i]<mn)mn=pixels[i]; if(pixels[i]>mx)mx=pixels[i]; }
+        applyRangeSmoothing(mn,mx,&tMin,&tMax);
+      }
+
+      for (int i=0;i<AMG88xx_PIXEL_ARRAY_SIZE;i++) latestFrame[i]=pixels[i];
+      latestFrameMin=tMin; latestFrameMax=tMax;
+      latestFrameMedian=medianTemp; latestFrameMillis=millis();
+      frameAvailable=true;
     }
-
-    for (int i=0;i<AMG88xx_PIXEL_ARRAY_SIZE;i++) latestFrame[i]=pixels[i];
-    latestFrameMin=tMin; latestFrameMax=tMax;
-    latestFrameMedian=medianTemp; latestFrameMillis=millis();
-    frameAvailable=true;
   }
 }
