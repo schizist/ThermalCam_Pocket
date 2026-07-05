@@ -12,6 +12,7 @@
 #include <ArduinoJson.h>
 #include <Adafruit_AMG88xx.h>
 #include <ArduinoOTA.h>
+#include <Preferences.h>
 #include <algorithm>
 #include <cmath>
 
@@ -82,6 +83,23 @@ static const unsigned long BLINK_NORMAL_MAX_MS = 86400000UL;
 static bool          manualPanActive        = false;
 static unsigned long lastManualPanMs        = 0;
 static const unsigned long MANUAL_PAN_TIMEOUT_MS = 20000;
+
+// Standby — pauses pan + blink movement. Deliberately NOT persisted to flash:
+// it always comes back up disabled after a reboot/power cycle.
+static bool          standbyMode            = false;
+
+// ─────────────────────────────────────────────
+// Settings persistence (NVS) — GUI changes survive reboot
+// ─────────────────────────────────────────────
+static Preferences prefs;
+static bool          settingsDirty   = false;
+static unsigned long settingsDirtyMs = 0;
+static const unsigned long SETTINGS_SAVE_DEBOUNCE_MS = 2000; // coalesce rapid slider drags into one flash write
+
+static void markSettingsDirty() {
+  settingsDirty   = true;
+  settingsDirtyMs = millis();
+}
 
 static void startBlink() {
   if (blinkPhase != BP_IDLE) return;
@@ -229,6 +247,44 @@ static const char *trackerStateName() {
   switch(trackerState){ case TS_TRACK: return "TRACK"; case TS_HOLD: return "HOLD"; default: return "SCAN"; }
 }
 
+static void loadSettings() {
+  prefs.begin("dollhead", true); // read-only
+  motorEnabled          = prefs.getBool("motorEn",      motorEnabled);
+  EYELID_OPEN_DEG        = prefs.getInt ("eyeOpen",      EYELID_OPEN_DEG);
+  EYELID_CLOSED_DEG      = prefs.getInt ("eyeClosed",    EYELID_CLOSED_DEG);
+  blinkIntervalMs        = prefs.getULong("blinkIntv",   blinkIntervalMs);
+  blinkDurationMs        = prefs.getULong("blinkDur",    blinkDurationMs);
+  rotateSpeed            = prefs.getFloat("rotSpeed",    rotateSpeed);
+  useInterpolation       = prefs.getBool("useInterp",    useInterpolation);
+  useManualRange         = prefs.getBool("useManRange",  useManualRange);
+  manualMin              = prefs.getFloat("manMin",      manualMin);
+  manualMax              = prefs.getFloat("manMax",      manualMax);
+  displayMode            = (DisplayMode)prefs.getInt("dispMode", (int)displayMode);
+  debugMode              = prefs.getBool("debugMode",    debugMode);
+  normalBlinkIntervalMs  = prefs.getULong("normBlinkIv", normalBlinkIntervalMs);
+  prefs.end();
+  Serial.println("[SETTINGS] Loaded from flash");
+}
+
+static void saveSettings() {
+  prefs.begin("dollhead", false);
+  prefs.putBool  ("motorEn",     motorEnabled);
+  prefs.putInt   ("eyeOpen",     EYELID_OPEN_DEG);
+  prefs.putInt   ("eyeClosed",   EYELID_CLOSED_DEG);
+  prefs.putULong ("blinkIntv",   blinkIntervalMs);
+  prefs.putULong ("blinkDur",    blinkDurationMs);
+  prefs.putFloat ("rotSpeed",    rotateSpeed);
+  prefs.putBool  ("useInterp",   useInterpolation);
+  prefs.putBool  ("useManRange", useManualRange);
+  prefs.putFloat ("manMin",      manualMin);
+  prefs.putFloat ("manMax",      manualMax);
+  prefs.putInt   ("dispMode",    (int)displayMode);
+  prefs.putBool  ("debugMode",   debugMode);
+  prefs.putULong ("normBlinkIv", normalBlinkIntervalMs);
+  prefs.end();
+  Serial.println("[SETTINGS] Saved to flash");
+}
+
 static void doScan() {
   rotateAngle += rotateSpeed * scanDirection;
   if (rotateAngle >= ROTATE_MAX_DEG) { rotateAngle = ROTATE_MAX_DEG; scanDirection = -1; }
@@ -365,6 +421,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
     button.tog { background:#2a2a2a; border:1px solid #444; border-radius:6px; color:#ccc;
                  padding:.35rem .75rem; cursor:pointer; font-size:.9rem; width:100%; margin-bottom:.5rem; }
     button.tog.on { background:#1a4a1a; border-color:#2c2; color:#4f4; font-weight:600; }
+    button.tog.standby-on { background:#4a3a00; border-color:#fc0; color:#fc0; font-weight:600; }
     .status { font-size:.9rem; opacity:.8; margin-bottom:.3rem; }
     .pan-row { display:flex; align-items:center; gap:.75rem; margin:.5rem 0; }
     .pan-btn { background:#2a2a2a; border:1px solid #444; border-radius:8px; color:#ccc;
@@ -381,6 +438,8 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
       <canvas id="heatmap" width="320" height="320"></canvas>
     </div>
     <div class="panel">
+      <button class="tog" id="standbyBtn">Standby: OFF</button>
+
       <div class="stats">
         <div class="stat">Min<span id="stat-min">--</span></div>
         <div class="stat">Median<span id="stat-median">--</span></div>
@@ -495,6 +554,14 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
       queue('displayMode',m);
       modeBtns.forEach(b=>b.classList.toggle('active',parseInt(b.dataset.mode)===m));
     }));
+
+    const standbyBtn=document.getElementById('standbyBtn');
+    let standbyOn=false;
+    standbyBtn.addEventListener('click',()=>{
+      standbyOn=!standbyOn; queue('standbyMode',standbyOn);
+      standbyBtn.textContent=standbyOn?'Standby: ON':'Standby: OFF';
+      standbyBtn.classList.toggle('standby-on',standbyOn);
+    });
 
     const motorBtn=document.getElementById('motorBtn');
     let motorOn=true;
@@ -631,6 +698,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
       if (d.useInterpolation!==undefined) ti.checked=d.useInterpolation;
       if (d.displayMode!==undefined) modeBtns.forEach(b=>b.classList.toggle('active',parseInt(b.dataset.mode)===d.displayMode));
       if (d.motorEnabled!==undefined){ motorOn=d.motorEnabled; motorBtn.textContent=motorOn?'Motor: ON':'Motor: OFF'; motorBtn.classList.toggle('on',motorOn); }
+      if (d.standbyMode!==undefined){ standbyOn=d.standbyMode; standbyBtn.textContent=standbyOn?'Standby: ON':'Standby: OFF'; standbyBtn.classList.toggle('standby-on',standbyOn); }
       if (d.debugMode!==undefined && d.debugMode!==isDebugMode) {
         isDebugMode=d.debugMode;
         document.getElementById('toggleDebug').checked=isDebugMode;
@@ -712,6 +780,7 @@ static void handleFrame() {
   doc["targetY"]         = trackTargetY;
   doc["trackerState"]    = trackerStateName();
   doc["motorEnabled"]         = motorEnabled;
+  doc["standbyMode"]          = standbyMode;
   doc["debugMode"]            = debugMode;
   doc["normalBlinkInterval"]  = (long)normalBlinkIntervalMs;
   doc["manualPanActive"]      = manualPanActive;
@@ -743,6 +812,7 @@ static void handleSettingsGet() {
   JsonDocument doc;
   doc["ip"]             = deviceIp;
   doc["motorEnabled"]        = motorEnabled;
+  doc["standbyMode"]         = standbyMode;
   doc["debugMode"]           = debugMode;
   doc["normalBlinkInterval"] = (long)normalBlinkIntervalMs;
   doc["manualPanActive"]     = manualPanActive;
@@ -765,30 +835,37 @@ static void handleSettingsPost() {
   if (!server.hasArg("plain")){ sendJsonError(400,"Missing body"); return; }
   JsonDocument doc;
   if (deserializeJson(doc,server.arg("plain"))){ sendJsonError(400,"Invalid JSON"); return; }
-  if (!doc["motorEnabled"].isNull())   motorEnabled    = doc["motorEnabled"].as<bool>();
-  if (!doc["eyeOpen"].isNull())        EYELID_OPEN_DEG = doc["eyeOpen"].as<int>();
-  if (!doc["eyeClosed"].isNull())      EYELID_CLOSED_DEG=doc["eyeClosed"].as<int>();
-  if (!doc["blinkInterval"].isNull())  blinkIntervalMs = doc["blinkInterval"].as<unsigned long>();
-  if (!doc["blinkDuration"].isNull())  blinkDurationMs = doc["blinkDuration"].as<unsigned long>();
-  if (!doc["rotateSpeed"].isNull())    rotateSpeed     = doc["rotateSpeed"].as<float>();
-  if (!doc["useInterpolation"].isNull()) useInterpolation=doc["useInterpolation"].as<bool>();
-  if (!doc["useManualRange"].isNull()) { useManualRange=doc["useManualRange"].as<bool>(); autoRangeInitialized=false; }
-  if (!doc["manualMin"].isNull())      manualMin       = doc["manualMin"].as<float>();
-  if (!doc["manualMax"].isNull())      manualMax       = doc["manualMax"].as<float>();
-  if (!doc["displayMode"].isNull())    displayMode     = (DisplayMode)doc["displayMode"].as<int>();
-  if (!doc["triggerBlink"].isNull() && doc["triggerBlink"].as<bool>()) triggerBlinkFlag=true;
-  if (!doc["debugMode"].isNull()) debugMode = doc["debugMode"].as<bool>();
+  if (!doc["motorEnabled"].isNull())   { motorEnabled    = doc["motorEnabled"].as<bool>(); markSettingsDirty(); }
+  if (!doc["eyeOpen"].isNull())        { EYELID_OPEN_DEG = doc["eyeOpen"].as<int>(); markSettingsDirty(); }
+  if (!doc["eyeClosed"].isNull())      { EYELID_CLOSED_DEG=doc["eyeClosed"].as<int>(); markSettingsDirty(); }
+  if (!doc["blinkInterval"].isNull())  { blinkIntervalMs = doc["blinkInterval"].as<unsigned long>(); markSettingsDirty(); }
+  if (!doc["blinkDuration"].isNull())  { blinkDurationMs = doc["blinkDuration"].as<unsigned long>(); markSettingsDirty(); }
+  if (!doc["rotateSpeed"].isNull())    { rotateSpeed     = doc["rotateSpeed"].as<float>(); markSettingsDirty(); }
+  if (!doc["useInterpolation"].isNull()) { useInterpolation=doc["useInterpolation"].as<bool>(); markSettingsDirty(); }
+  if (!doc["useManualRange"].isNull()) { useManualRange=doc["useManualRange"].as<bool>(); autoRangeInitialized=false; markSettingsDirty(); }
+  if (!doc["manualMin"].isNull())      { manualMin       = doc["manualMin"].as<float>(); markSettingsDirty(); }
+  if (!doc["manualMax"].isNull())      { manualMax       = doc["manualMax"].as<float>(); markSettingsDirty(); }
+  if (!doc["displayMode"].isNull())    { displayMode     = (DisplayMode)doc["displayMode"].as<int>(); markSettingsDirty(); }
+  if (!doc["triggerBlink"].isNull() && doc["triggerBlink"].as<bool>() && !standbyMode) triggerBlinkFlag=true;
+  if (!doc["debugMode"].isNull()) { debugMode = doc["debugMode"].as<bool>(); markSettingsDirty(); }
   if (!doc["normalBlinkInterval"].isNull()) {
     unsigned long v = doc["normalBlinkInterval"].as<unsigned long>();
     normalBlinkIntervalMs = constrain(v, BLINK_NORMAL_MIN_MS, BLINK_NORMAL_MAX_MS);
+    markSettingsDirty();
   }
-  if (!doc["panLeft"].isNull() && doc["panLeft"].as<bool>()) {
+  // standbyMode is intentionally not persisted — see declaration comment
+  if (!doc["standbyMode"].isNull()) {
+    bool v = doc["standbyMode"].as<bool>();
+    if (standbyMode && !v) blinkPhaseMs = millis(); // avoid an immediate blink from a stale timer on wake
+    standbyMode = v;
+  }
+  if (!standbyMode && !doc["panLeft"].isNull() && doc["panLeft"].as<bool>()) {
     rotateAngle = constrain(rotateAngle - rotateSpeed * 3.0f, ROTATE_MIN_DEG, ROTATE_MAX_DEG);
     servoWrite(ROTATE_SERVO_PIN, rotateAngle);
     manualPanActive = true;
     lastManualPanMs = millis();
   }
-  if (!doc["panRight"].isNull() && doc["panRight"].as<bool>()) {
+  if (!standbyMode && !doc["panRight"].isNull() && doc["panRight"].as<bool>()) {
     rotateAngle = constrain(rotateAngle + rotateSpeed * 3.0f, ROTATE_MIN_DEG, ROTATE_MAX_DEG);
     servoWrite(ROTATE_SERVO_PIN, rotateAngle);
     manualPanActive = true;
@@ -811,6 +888,8 @@ void setup() {
   int rrc = (int)esp_reset_reason();
   Serial.printf("\nReset: %s (%d)\n", (rrc<17?rr[rrc]:"?"), rrc);
   Serial.println("Doll Head Tracker v2 booting..."); Serial.flush();
+
+  loadSettings();
 
   Serial.println("Servo init..."); Serial.flush();
   ledcAttach(ROTATE_SERVO_PIN, SERVO_FREQ, SERVO_RESOLUTION);
@@ -868,8 +947,15 @@ void loop() {
   server.handleClient();
   delay(5); // yield to FreeRTOS/WiFi background tasks — prevents watchdog reset
 
-  if (triggerBlinkFlag){ triggerBlinkFlag=false; startBlink(); }
-  updateBlink();
+  if (!standbyMode) {
+    if (triggerBlinkFlag){ triggerBlinkFlag=false; startBlink(); }
+    updateBlink();
+  }
+
+  if (settingsDirty && millis() - settingsDirtyMs >= SETTINGS_SAVE_DEBOUNCE_MS) {
+    settingsDirty = false;
+    saveSettings();
+  }
 
   static unsigned long lastAmgMs = 0;
   unsigned long nowMs = millis();
@@ -877,7 +963,7 @@ void loop() {
     lastAmgMs = nowMs;
     amg.readPixels(pixels);
     float medianTemp=computeMedian(pixels,AMG88xx_PIXEL_ARRAY_SIZE);
-    updateStepper(pixels,medianTemp);
+    if (!standbyMode) updateStepper(pixels,medianTemp);
 
     float tMin,tMax;
     if (useManualRange) {
