@@ -7,6 +7,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <WiFi.h>
+#include <WiFiMulti.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
 #include <ArduinoJson.h>
@@ -22,9 +23,22 @@
 #ifndef WIFI_PASSWORD
 #define WIFI_PASSWORD ""
 #endif
+#ifndef WIFI2_SSID
+#define WIFI2_SSID ""
+#endif
+#ifndef WIFI2_PASSWORD
+#define WIFI2_PASSWORD ""
+#endif
+#ifndef AP_PASSWORD
+#define AP_PASSWORD "dollhead"
+#endif
 #ifndef OTA_PASSWORD
 #define OTA_PASSWORD ""
 #endif
+
+// Same address on every network: http://dollhead.local/
+#define DEVICE_HOSTNAME "dollhead"
+#define FALLBACK_AP_SSID "DollHead-Setup"
 
 // ─────────────────────────────────────────────
 // Pin definitions
@@ -84,9 +98,29 @@ static bool          manualPanActive        = false;
 static unsigned long lastManualPanMs        = 0;
 static const unsigned long MANUAL_PAN_TIMEOUT_MS = 20000;
 
-// Standby — pauses pan + blink movement. Deliberately NOT persisted to flash:
-// it always comes back up disabled after a reboot/power cycle.
+// Standby — pauses pan + blink movement. This is the effective state, recomputed
+// by updateStandby() from the run mode and the schedule.
 static bool          standbyMode            = false;
+
+// Run mode. Standby is deliberately NOT persisted to flash: it always comes back
+// up Active after a reboot/power cycle. Periodic and the schedule are persisted.
+enum RunMode { RUN_ACTIVE = 0, RUN_STANDBY = 1, RUN_PERIODIC = 2 };
+static RunMode       runMode                = RUN_ACTIVE;
+
+// Periodic — alternates random-length rest (standby) and active phases
+static const unsigned long PERIODIC_MIN_MS = 2UL * 60UL * 1000UL;   // 2 min
+static const unsigned long PERIODIC_MAX_MS = 2UL * 3600UL * 1000UL; // 2 hr
+static bool          periodicResting        = false;
+static unsigned long periodicPhaseStartMs   = 0;
+static unsigned long periodicPhaseLenMs     = 0;
+
+// Standby schedule — daily window in local time, may wrap past midnight.
+// Overrides the run mode while the window is open.
+static bool          schedEnabled           = false;
+static int           schedStartMin          = 22 * 60; // minutes after midnight
+static int           schedEndMin            = 7 * 60;
+static bool          schedActive            = false;
+static String        tzPosix                = "";      // POSIX TZ; set by the web UI on first visit
 
 // ─────────────────────────────────────────────
 // Settings persistence (NVS) — GUI changes survive reboot
@@ -99,6 +133,79 @@ static const unsigned long SETTINGS_SAVE_DEBOUNCE_MS = 2000; // coalesce rapid s
 static void markSettingsDirty() {
   settingsDirty   = true;
   settingsDirtyMs = millis();
+}
+
+static unsigned long randomPeriodicMs() {
+  return PERIODIC_MIN_MS + esp_random() % (PERIODIC_MAX_MS - PERIODIC_MIN_MS + 1);
+}
+
+static void startPeriodicPhase(bool resting) {
+  periodicResting      = resting;
+  periodicPhaseStartMs = millis();
+  periodicPhaseLenMs   = randomPeriodicMs();
+  Serial.printf("[PERIODIC] %s for %lu s\n", resting ? "Resting" : "Active", periodicPhaseLenMs / 1000);
+}
+
+static void setRunMode(RunMode m) {
+  if (m == runMode) return;
+  runMode = m;
+  if (m == RUN_PERIODIC) startPeriodicPhase(false);
+  markSettingsDirty();
+}
+
+static void applyTimezone() {
+  setenv("TZ", tzPosix.length() ? tzPosix.c_str() : "UTC0", 1);
+  tzset();
+}
+
+// False until the clock has been set by NTP or by the browser
+static bool localClockValid(struct tm *t) {
+  time_t now = time(nullptr);
+  if (now < 1700000000) return false;
+  localtime_r(&now, t);
+  return true;
+}
+
+static bool inScheduleWindow() {
+  struct tm t;
+  if (!schedEnabled || schedStartMin == schedEndMin || !localClockValid(&t)) return false;
+  int nowMin = t.tm_hour * 60 + t.tm_min;
+  if (schedStartMin < schedEndMin) return nowMin >= schedStartMin && nowMin < schedEndMin;
+  return nowMin >= schedStartMin || nowMin < schedEndMin; // wraps past midnight
+}
+
+static void updateStandby() {
+  if (runMode == RUN_PERIODIC && millis() - periodicPhaseStartMs >= periodicPhaseLenMs)
+    startPeriodicPhase(!periodicResting);
+  schedActive = inScheduleWindow();
+  bool want = schedActive || runMode == RUN_STANDBY || (runMode == RUN_PERIODIC && periodicResting);
+  if (want == standbyMode) return;
+  if (!want) blinkPhaseMs = millis(); // avoid an immediate blink from a stale timer on wake
+  standbyMode = want;
+  Serial.printf("[STANDBY] %s\n", want ? "ON" : "OFF");
+}
+
+static String fmtDuration(unsigned long sec) {
+  if (sec < 60)   return String(sec) + "s";
+  if (sec < 3600) return String(sec / 60) + "m";
+  return String(sec / 3600) + "h " + String((sec % 3600) / 60) + "m";
+}
+
+static String runStatusText() {
+  if (schedActive) {
+    char hhmm[6];
+    snprintf(hhmm, sizeof hhmm, "%02d:%02d", schedEndMin / 60, schedEndMin % 60);
+    return String("Scheduled standby until ") + hhmm;
+  }
+  switch (runMode) {
+    case RUN_STANDBY: return "Standby";
+    case RUN_PERIODIC: {
+      unsigned long el = millis() - periodicPhaseStartMs;
+      unsigned long left = el < periodicPhaseLenMs ? (periodicPhaseLenMs - el) / 1000 : 0;
+      return String(periodicResting ? "Periodic: resting, wakes in " : "Periodic: active, rests in ") + fmtDuration(left);
+    }
+    default: return "Active";
+  }
 }
 
 static void startBlink() {
@@ -262,7 +369,13 @@ static void loadSettings() {
   displayMode            = (DisplayMode)prefs.getInt("dispMode", (int)displayMode);
   debugMode              = prefs.getBool("debugMode",    debugMode);
   normalBlinkIntervalMs  = prefs.getULong("normBlinkIv", normalBlinkIntervalMs);
+  runMode                = prefs.getInt("runMode", RUN_ACTIVE) == RUN_PERIODIC ? RUN_PERIODIC : RUN_ACTIVE;
+  schedEnabled           = prefs.getBool("schedEn",      schedEnabled);
+  schedStartMin          = prefs.getInt ("schedStart",   schedStartMin);
+  schedEndMin            = prefs.getInt ("schedEnd",     schedEndMin);
+  tzPosix                = prefs.getString("tz",         tzPosix);
   prefs.end();
+  if (runMode == RUN_PERIODIC) startPeriodicPhase(false);
   Serial.println("[SETTINGS] Loaded from flash");
 }
 
@@ -281,6 +394,11 @@ static void saveSettings() {
   prefs.putInt   ("dispMode",    (int)displayMode);
   prefs.putBool  ("debugMode",   debugMode);
   prefs.putULong ("normBlinkIv", normalBlinkIntervalMs);
+  prefs.putInt   ("runMode",     runMode == RUN_PERIODIC ? RUN_PERIODIC : RUN_ACTIVE); // never persist Standby
+  prefs.putBool  ("schedEn",     schedEnabled);
+  prefs.putInt   ("schedStart",  schedStartMin);
+  prefs.putInt   ("schedEnd",    schedEndMin);
+  prefs.putString("tz",          tzPosix);
   prefs.end();
   Serial.println("[SETTINGS] Saved to flash");
 }
@@ -384,6 +502,61 @@ float         latestFrameMedian = 0.0f;
 unsigned long latestFrameMillis = 0;
 String        deviceIp;
 
+// ─────────────────────────────────────────────
+// WiFi — joins whichever known network is in range (home or work),
+// falls back to its own hotspot if neither is found
+// ─────────────────────────────────────────────
+WiFiMulti wifiMulti;
+static bool          fallbackApActive  = false;
+static unsigned long lastWifiRetryMs   = 0;
+static const unsigned long WIFI_CONNECT_TIMEOUT_MS = 20000;
+static const unsigned long WIFI_RETRY_INTERVAL_MS  = 30000;
+
+static void onWifiConnected() {
+  deviceIp = WiFi.localIP().toString();
+  Serial.printf("WiFi connected to \"%s\" — IP: %s\n", WiFi.SSID().c_str(), deviceIp.c_str());
+  // (Re)start NTP on every join — the clock drives the standby schedule
+  configTzTime(tzPosix.length() ? tzPosix.c_str() : "UTC0", "pool.ntp.org", "time.google.com");
+  if (fallbackApActive) {
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_STA);
+    fallbackApActive = false;
+    Serial.println("Fallback hotspot stopped");
+  }
+}
+
+static void startFallbackAp() {
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(FALLBACK_AP_SSID, strlen(AP_PASSWORD) >= 8 ? AP_PASSWORD : nullptr);
+  fallbackApActive = true;
+  deviceIp = WiFi.softAPIP().toString();
+  Serial.printf("No known WiFi — hotspot \"%s\" up at %s\n", FALLBACK_AP_SSID, deviceIp.c_str());
+}
+
+static void setupWifi() {
+  WiFi.setHostname(DEVICE_HOSTNAME); // must precede mode/begin; lets routers show "dollhead"
+  WiFi.mode(WIFI_STA);
+  if (strlen(WIFI_SSID)  > 0) wifiMulti.addAP(WIFI_SSID,  WIFI_PASSWORD);
+  if (strlen(WIFI2_SSID) > 0) wifiMulti.addAP(WIFI2_SSID, WIFI2_PASSWORD);
+  Serial.println("Connecting to WiFi...");
+  if (wifiMulti.run(WIFI_CONNECT_TIMEOUT_MS) == WL_CONNECTED) onWifiConnected();
+  else startFallbackAp();
+  lastWifiRetryMs = millis();
+  if (MDNS.begin(DEVICE_HOSTNAME)) {
+    MDNS.addService("http", "tcp", 80);
+    Serial.println("mDNS: http://" DEVICE_HOSTNAME ".local/");
+  }
+}
+
+// Reconnect after drop-outs, or keep looking for a known network while on the hotspot
+static void maintainWifi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  if (millis() - lastWifiRetryMs < WIFI_RETRY_INTERVAL_MS) return;
+  lastWifiRetryMs = millis();
+  if (!fallbackApActive) deviceIp = "reconnecting";
+  if (wifiMulti.run(5000) == WL_CONNECTED) onWifiConnected();
+}
+
 static const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="en">
@@ -391,6 +564,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Doll Head Tracker</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>👶</text></svg>">
   <style>
     :root { color-scheme: dark; font-family: Segoe UI, Arial, sans-serif; }
     body { margin:0 auto; max-width:960px; padding:1.5rem; background:#111; color:#f0f0f0; }
@@ -415,14 +589,15 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
     .state-track { background:#1a4a1a; color:#4f4; }
     .state-hold  { background:#4a3a00; color:#fc0; }
     .state-scan  { background:#2a1a4a; color:#a8f; }
-    .mode-btn { background:#2a2a2a; border:1px solid #444; border-radius:6px; color:#ccc;
+    .mode-btn, .run-btn { background:#2a2a2a; border:1px solid #444; border-radius:6px; color:#ccc;
                 padding:.35rem .75rem; cursor:pointer; font-size:.9rem; }
-    .mode-btn.active { background:#0a3a5a; border-color:#08f; color:#8df; font-weight:600; }
+    .mode-btn.active, .run-btn.active { background:#0a3a5a; border-color:#08f; color:#8df; font-weight:600; }
     button.tog { background:#2a2a2a; border:1px solid #444; border-radius:6px; color:#ccc;
                  padding:.35rem .75rem; cursor:pointer; font-size:.9rem; width:100%; margin-bottom:.5rem; }
     button.tog.on { background:#1a4a1a; border-color:#2c2; color:#4f4; font-weight:600; }
-    button.tog.standby-on { background:#4a3a00; border-color:#fc0; color:#fc0; font-weight:600; }
     .status { font-size:.9rem; opacity:.8; margin-bottom:.3rem; }
+    .status.standby { color:#fc0; opacity:1; font-weight:600; }
+    select { background:#2a2a2a; color:#ccc; border:1px solid #444; border-radius:6px; padding:.3rem; }
     .pan-row { display:flex; align-items:center; gap:.75rem; margin:.5rem 0; }
     .pan-btn { background:#2a2a2a; border:1px solid #444; border-radius:8px; color:#ccc;
                font-size:1.4rem; padding:.4rem .9rem; cursor:pointer; flex:0 0 auto;
@@ -438,7 +613,12 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
       <canvas id="heatmap" width="320" height="320"></canvas>
     </div>
     <div class="panel">
-      <button class="tog" id="standbyBtn">Standby: OFF</button>
+      <div class="toggle-row" style="margin-bottom:.4rem">
+        <button class="run-btn active" data-run="0">Active</button>
+        <button class="run-btn" data-run="1">Standby</button>
+        <button class="run-btn" data-run="2">Periodic</button>
+      </div>
+      <div class="status" id="runStatus" style="margin-bottom:1rem">--</div>
 
       <div class="stats">
         <div class="stat">Min<span id="stat-min">--</span></div>
@@ -504,6 +684,30 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
         <input type="range" id="rotateSpeed" min="0.5" max="10" step="0.5">
       </label>
 
+      <div class="group-title">Standby Schedule</div>
+      <div class="toggle-row">
+        <label><input type="checkbox" id="schedEnabled"> Standby every day</label>
+      </div>
+      <div class="toggle-row">
+        <label>From <input type="time" id="schedStart"></label>
+        <label>to <input type="time" id="schedEnd"></label>
+      </div>
+      <label>Time zone
+        <select id="tzSelect">
+          <option value="EST5EDT,M3.2.0,M11.1.0">US Eastern</option>
+          <option value="CST6CDT,M3.2.0,M11.1.0">US Central</option>
+          <option value="MST7MDT,M3.2.0,M11.1.0">US Mountain</option>
+          <option value="MST7">US Arizona</option>
+          <option value="PST8PDT,M3.2.0,M11.1.0">US Pacific</option>
+          <option value="AKST9AKDT,M3.2.0,M11.1.0">US Alaska</option>
+          <option value="HST10">US Hawaii</option>
+          <option value="GMT0BST,M3.5.0/1,M10.5.0">UK</option>
+          <option value="CET-1CEST,M3.5.0,M10.5.0/3">Central Europe</option>
+          <option value="UTC0">UTC</option>
+        </select>
+      </label>
+      <div class="status">Device clock: <span id="deviceClock">--</span></div>
+
       <div class="group-title">Status</div>
       <div class="status">State: <span id="tracker-state" class="state-badge state-scan">SCAN</span></div>
       <div class="status">Target: <span id="target-pos">--</span></div>
@@ -555,13 +759,43 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
       modeBtns.forEach(b=>b.classList.toggle('active',parseInt(b.dataset.mode)===m));
     }));
 
-    const standbyBtn=document.getElementById('standbyBtn');
-    let standbyOn=false;
-    standbyBtn.addEventListener('click',()=>{
-      standbyOn=!standbyOn; queue('standbyMode',standbyOn);
-      standbyBtn.textContent=standbyOn?'Standby: ON':'Standby: OFF';
-      standbyBtn.classList.toggle('standby-on',standbyOn);
-    });
+    const runBtns = document.querySelectorAll('.run-btn');
+    runBtns.forEach(btn=>btn.addEventListener('click',()=>{
+      queue('runMode',parseInt(btn.dataset.run));
+      runBtns.forEach(b=>b.classList.toggle('active',b===btn));
+    }));
+
+    // Standby schedule — times are sent as minutes after midnight
+    const toMin  = v=>{ const [h,m]=v.split(':').map(Number); return h*60+m; };
+    const toHHMM = n=>String(Math.floor(n/60)).padStart(2,'0')+':'+String(n%60).padStart(2,'0');
+    const schedEn=document.getElementById('schedEnabled');
+    const schedStart=document.getElementById('schedStart'), schedEnd=document.getElementById('schedEnd');
+    const tzSel=document.getElementById('tzSelect');
+    schedEn.addEventListener('change',()=>queue('schedEnabled',schedEn.checked));
+    schedStart.addEventListener('change',()=>{ if(schedStart.value) queue('schedStart',toMin(schedStart.value)); });
+    schedEnd.addEventListener('change',  ()=>{ if(schedEnd.value)   queue('schedEnd',  toMin(schedEnd.value)); });
+    tzSel.addEventListener('change',()=>queue('tz',tzSel.value));
+
+    function setTzSelect(v) {
+      if (!v) return;
+      if (![...tzSel.options].some(o=>o.value===v)) tzSel.add(new Option(`Custom (${v})`, v));
+      tzSel.value=v;
+    }
+    // Map the browser's zone to a POSIX TZ string; unknown zones get a fixed offset (no DST)
+    const TZ_BY_IANA={
+      'America/New_York':'EST5EDT,M3.2.0,M11.1.0','America/Detroit':'EST5EDT,M3.2.0,M11.1.0',
+      'America/Chicago':'CST6CDT,M3.2.0,M11.1.0','America/Denver':'MST7MDT,M3.2.0,M11.1.0',
+      'America/Phoenix':'MST7','America/Los_Angeles':'PST8PDT,M3.2.0,M11.1.0',
+      'America/Anchorage':'AKST9AKDT,M3.2.0,M11.1.0','Pacific/Honolulu':'HST10',
+      'Europe/London':'GMT0BST,M3.5.0/1,M10.5.0','UTC':'UTC0',
+    };
+    function browserTz() {
+      const z=Intl.DateTimeFormat().resolvedOptions().timeZone;
+      if (TZ_BY_IANA[z]) return TZ_BY_IANA[z];
+      if (/^Europe\/(Berlin|Paris|Madrid|Rome|Amsterdam|Brussels|Vienna|Stockholm|Oslo|Copenhagen|Warsaw|Prague|Zurich)$/.test(z)) return 'CET-1CEST,M3.5.0,M10.5.0/3';
+      const off=new Date().getTimezoneOffset(), h=Math.trunc(Math.abs(off)/60), m=Math.abs(off)%60;
+      return `UTC${off<0?'-':''}${h}${m?':'+String(m).padStart(2,'0'):''}`;
+    }
 
     const motorBtn=document.getElementById('motorBtn');
     let motorOn=true;
@@ -698,7 +932,13 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
       if (d.useInterpolation!==undefined) ti.checked=d.useInterpolation;
       if (d.displayMode!==undefined) modeBtns.forEach(b=>b.classList.toggle('active',parseInt(b.dataset.mode)===d.displayMode));
       if (d.motorEnabled!==undefined){ motorOn=d.motorEnabled; motorBtn.textContent=motorOn?'Motor: ON':'Motor: OFF'; motorBtn.classList.toggle('on',motorOn); }
-      if (d.standbyMode!==undefined){ standbyOn=d.standbyMode; standbyBtn.textContent=standbyOn?'Standby: ON':'Standby: OFF'; standbyBtn.classList.toggle('standby-on',standbyOn); }
+      if (d.runMode!==undefined) runBtns.forEach(b=>b.classList.toggle('active',parseInt(b.dataset.run)===d.runMode));
+      if (d.runStatus!==undefined){ const rs=document.getElementById('runStatus'); rs.textContent=d.runStatus; rs.classList.toggle('standby',!!d.standbyMode); }
+      if (d.schedEnabled!==undefined) schedEn.checked=d.schedEnabled;
+      if (d.schedStart!==undefined && document.activeElement!==schedStart) schedStart.value=toHHMM(d.schedStart);
+      if (d.schedEnd!==undefined   && document.activeElement!==schedEnd)   schedEnd.value=toHHMM(d.schedEnd);
+      if (d.tz!==undefined && document.activeElement!==tzSel) setTzSelect(d.tz);
+      if (d.clock!==undefined) document.getElementById('deviceClock').textContent=d.clock||'not set yet';
       if (d.debugMode!==undefined && d.debugMode!==isDebugMode) {
         isDebugMode=d.debugMode;
         document.getElementById('toggleDebug').checked=isDebugMode;
@@ -751,7 +991,12 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
       }).finally(()=>{ setTimeout(fetchFrame, 350); });
     }
 
-    fetch('/settings').then(r=>r.json()).then(applySettings).catch(console.error);
+    fetch('/settings').then(r=>r.json()).then(d=>{
+      applySettings(d);
+      // First visit: give the device our time zone, and the time if it has no internet clock
+      if (!d.tz) { const tz=browserTz(); setTzSelect(tz); queue('tz',tz); }
+      if (!d.clock) queue('clientEpoch',Math.floor(Date.now()/1000));
+    }).catch(console.error);
     fetchFrame();
     setInterval(updateAge,250);
   </script>
@@ -769,6 +1014,18 @@ static void sendJsonError(int code, const char *msg) {
   JsonDocument doc; doc["error"]=msg;
   String p; serializeJson(doc,p); server.send(code,"application/json",p);
 }
+static void addRunFields(JsonDocument &doc) {
+  doc["runMode"]      = (int)runMode;
+  doc["standbyMode"]  = standbyMode;
+  doc["runStatus"]    = runStatusText();
+  doc["schedEnabled"] = schedEnabled;
+  doc["schedStart"]   = schedStartMin;
+  doc["schedEnd"]     = schedEndMin;
+  doc["tz"]           = tzPosix;
+  struct tm t; char clk[6] = "";
+  if (localClockValid(&t)) snprintf(clk, sizeof clk, "%02d:%02d", t.tm_hour, t.tm_min);
+  doc["clock"]        = clk;
+}
 static void handleIndex() { server.send_P(200,"text/html",INDEX_HTML); }
 
 static void handleFrame() {
@@ -780,7 +1037,7 @@ static void handleFrame() {
   doc["targetY"]         = trackTargetY;
   doc["trackerState"]    = trackerStateName();
   doc["motorEnabled"]         = motorEnabled;
-  doc["standbyMode"]          = standbyMode;
+  addRunFields(doc);
   doc["debugMode"]            = debugMode;
   doc["normalBlinkInterval"]  = (long)normalBlinkIntervalMs;
   doc["manualPanActive"]      = manualPanActive;
@@ -812,7 +1069,7 @@ static void handleSettingsGet() {
   JsonDocument doc;
   doc["ip"]             = deviceIp;
   doc["motorEnabled"]        = motorEnabled;
-  doc["standbyMode"]         = standbyMode;
+  addRunFields(doc);
   doc["debugMode"]           = debugMode;
   doc["normalBlinkInterval"] = (long)normalBlinkIntervalMs;
   doc["manualPanActive"]     = manualPanActive;
@@ -853,12 +1110,25 @@ static void handleSettingsPost() {
     normalBlinkIntervalMs = constrain(v, BLINK_NORMAL_MIN_MS, BLINK_NORMAL_MAX_MS);
     markSettingsDirty();
   }
-  // standbyMode is intentionally not persisted — see declaration comment
-  if (!doc["standbyMode"].isNull()) {
-    bool v = doc["standbyMode"].as<bool>();
-    if (standbyMode && !v) blinkPhaseMs = millis(); // avoid an immediate blink from a stale timer on wake
-    standbyMode = v;
+  if (!doc["runMode"].isNull()) setRunMode((RunMode)constrain(doc["runMode"].as<int>(), 0, 2));
+  // standbyMode kept for API compatibility: true = Standby, false = Active
+  if (!doc["standbyMode"].isNull()) setRunMode(doc["standbyMode"].as<bool>() ? RUN_STANDBY : RUN_ACTIVE);
+  if (!doc["schedEnabled"].isNull()) { schedEnabled  = doc["schedEnabled"].as<bool>(); markSettingsDirty(); }
+  if (!doc["schedStart"].isNull())   { schedStartMin = constrain(doc["schedStart"].as<int>(), 0, 1439); markSettingsDirty(); }
+  if (!doc["schedEnd"].isNull())     { schedEndMin   = constrain(doc["schedEnd"].as<int>(),   0, 1439); markSettingsDirty(); }
+  if (!doc["tz"].isNull()) {
+    tzPosix = doc["tz"].as<String>().substring(0, 63);
+    applyTimezone();
+    markSettingsDirty();
   }
+  // Browser supplies the time when NTP hasn't (e.g. on the fallback hotspot)
+  struct tm nowTm;
+  if (!doc["clientEpoch"].isNull() && !localClockValid(&nowTm)) {
+    struct timeval tv = { (time_t)doc["clientEpoch"].as<long long>(), 0 };
+    settimeofday(&tv, nullptr);
+    Serial.println("[TIME] Clock set from browser");
+  }
+  updateStandby(); // apply now so pan checks and the response see the new state
   if (!standbyMode && !doc["panLeft"].isNull() && doc["panLeft"].as<bool>()) {
     rotateAngle = constrain(rotateAngle - rotateSpeed * 3.0f, ROTATE_MIN_DEG, ROTATE_MAX_DEG);
     servoWrite(ROTATE_SERVO_PIN, rotateAngle);
@@ -890,6 +1160,7 @@ void setup() {
   Serial.println("Doll Head Tracker v2 booting..."); Serial.flush();
 
   loadSettings();
+  applyTimezone();
 
   Serial.println("Servo init..."); Serial.flush();
   ledcAttach(ROTATE_SERVO_PIN, SERVO_FREQ, SERVO_RESOLUTION);
@@ -905,27 +1176,18 @@ void setup() {
   if (!amg.begin()) { Serial.println("ERROR: AMG8833 not found!"); Serial.flush(); }
   else              { Serial.println("AMG8833 OK"); Serial.flush(); }
 
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.print("Connecting to WiFi");
-  unsigned long wifiStart=millis();
-  while (WiFi.status()!=WL_CONNECTED && millis()-wifiStart<15000){ delay(500); Serial.print("."); }
-  if (WiFi.status()==WL_CONNECTED) {
-    deviceIp=WiFi.localIP().toString();
-    Serial.printf("\nWiFi connected — IP: %s\n", deviceIp.c_str());
-    if (MDNS.begin("dollhead")) Serial.println("mDNS: http://dollhead.local/");
-  } else {
-    deviceIp="no wifi"; Serial.println("\nWiFi failed.");
-  }
+  setupWifi();
 
   server.on("/",          handleIndex);
+  server.on("/favicon.ico", []() { server.send(204); }); // icon is inline in the page; skip the redirect
   server.on("/frame",     HTTP_GET,  handleFrame);
   server.on("/settings",  HTTP_GET,  handleSettingsGet);
   server.on("/settings",  HTTP_POST, handleSettingsPost);
   server.onNotFound(handleNotFound);
   server.begin();
 
-  ArduinoOTA.setHostname("dollhead");
+  ArduinoOTA.setHostname(DEVICE_HOSTNAME);
+  ArduinoOTA.setMdnsEnabled(false); // MDNS already started in setupWifi()
   if (strlen(OTA_PASSWORD)>0) ArduinoOTA.setPassword(OTA_PASSWORD);
   ArduinoOTA.onStart([]()  { Serial.println("OTA start"); });
   ArduinoOTA.onProgress([](unsigned int p,unsigned int t){ Serial.printf("OTA: %u%%\r",p*100/t); });
@@ -943,6 +1205,8 @@ void loop() {
   static bool firstLoop = true;
   if (firstLoop) { firstLoop = false; Serial.println("Loop start"); Serial.flush(); }
 
+  maintainWifi();
+  updateStandby();
   ArduinoOTA.handle();
   server.handleClient();
   delay(5); // yield to FreeRTOS/WiFi background tasks — prevents watchdog reset
