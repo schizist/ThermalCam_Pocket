@@ -96,6 +96,8 @@ as soon as it joins one.
 - **Standby schedule:** tick *Standby every day* and set a From/To time (it can
   wrap past midnight, e.g. 22:00 to 07:00). While the window is open the head
   is in standby, whatever the mode. When it closes, the selected mode resumes.
+  - Tick *Standby all weekend* to keep it in standby all day Saturday and
+    Sunday. This works with or without the daily window.
   - The schedule needs the device's clock. It gets the time from the internet,
     or from your browser when there's no internet (e.g. on the backup
     hotspot). **Device clock** shows the time the device thinks it is.
@@ -169,6 +171,7 @@ Run and schedule keys for `POST /settings`:
 | `runMode`      | `0` Active, `1` Standby, `2` Periodic                           |
 | `standbyMode`  | `true` / `false`, same as `runMode` 1 / 0 (older key)           |
 | `schedEnabled` | `true` / `false`                                                |
+| `weekendStandby` | `true` / `false`: standby all day Saturday and Sunday         |
 | `schedStart`, `schedEnd` | minutes after midnight, local time (e.g. `1320` = 22:00) |
 | `tz`           | POSIX time zone string, e.g. `CST6CDT,M3.2.0,M11.1.0`           |
 

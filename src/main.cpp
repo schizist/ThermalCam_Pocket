@@ -120,6 +120,8 @@ static bool          schedEnabled           = false;
 static int           schedStartMin          = 22 * 60; // minutes after midnight
 static int           schedEndMin            = 7 * 60;
 static bool          schedActive            = false;
+static bool          weekendStandby         = false; // all of Saturday + Sunday, local time
+static bool          weekendActive          = false;
 static String        tzPosix                = "";      // POSIX TZ; set by the web UI on first visit
 
 // ─────────────────────────────────────────────
@@ -174,11 +176,18 @@ static bool inScheduleWindow() {
   return nowMin >= schedStartMin || nowMin < schedEndMin; // wraps past midnight
 }
 
+static bool isWeekendNow() {
+  struct tm t;
+  if (!weekendStandby || !localClockValid(&t)) return false;
+  return t.tm_wday == 0 || t.tm_wday == 6; // Sunday, Saturday
+}
+
 static void updateStandby() {
   if (runMode == RUN_PERIODIC && millis() - periodicPhaseStartMs >= periodicPhaseLenMs)
     startPeriodicPhase(!periodicResting);
-  schedActive = inScheduleWindow();
-  bool want = schedActive || runMode == RUN_STANDBY || (runMode == RUN_PERIODIC && periodicResting);
+  schedActive   = inScheduleWindow();
+  weekendActive = isWeekendNow();
+  bool want = schedActive || weekendActive || runMode == RUN_STANDBY || (runMode == RUN_PERIODIC && periodicResting);
   if (want == standbyMode) return;
   if (!want) blinkPhaseMs = millis(); // avoid an immediate blink from a stale timer on wake
   standbyMode = want;
@@ -192,6 +201,7 @@ static String fmtDuration(unsigned long sec) {
 }
 
 static String runStatusText() {
+  if (weekendActive) return "Weekend standby";
   if (schedActive) {
     char hhmm[6];
     snprintf(hhmm, sizeof hhmm, "%02d:%02d", schedEndMin / 60, schedEndMin % 60);
@@ -374,6 +384,7 @@ static void loadSettings() {
   schedStartMin          = prefs.getInt ("schedStart",   schedStartMin);
   schedEndMin            = prefs.getInt ("schedEnd",     schedEndMin);
   tzPosix                = prefs.getString("tz",         tzPosix);
+  weekendStandby         = prefs.getBool("weekendSb",    weekendStandby);
   prefs.end();
   if (runMode == RUN_PERIODIC) startPeriodicPhase(false);
   Serial.println("[SETTINGS] Loaded from flash");
@@ -399,6 +410,7 @@ static void saveSettings() {
   prefs.putInt   ("schedStart",  schedStartMin);
   prefs.putInt   ("schedEnd",    schedEndMin);
   prefs.putString("tz",          tzPosix);
+  prefs.putBool  ("weekendSb",   weekendStandby);
   prefs.end();
   Serial.println("[SETTINGS] Saved to flash");
 }
@@ -692,6 +704,9 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
         <label>From <input type="time" id="schedStart"></label>
         <label>to <input type="time" id="schedEnd"></label>
       </div>
+      <div class="toggle-row">
+        <label><input type="checkbox" id="weekendStandby"> Standby all weekend (Sat + Sun)</label>
+      </div>
       <label>Time zone
         <select id="tzSelect">
           <option value="EST5EDT,M3.2.0,M11.1.0">US Eastern</option>
@@ -772,6 +787,8 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
     const schedStart=document.getElementById('schedStart'), schedEnd=document.getElementById('schedEnd');
     const tzSel=document.getElementById('tzSelect');
     schedEn.addEventListener('change',()=>queue('schedEnabled',schedEn.checked));
+    const weekendEl=document.getElementById('weekendStandby');
+    weekendEl.addEventListener('change',()=>queue('weekendStandby',weekendEl.checked));
     schedStart.addEventListener('change',()=>{ if(schedStart.value) queue('schedStart',toMin(schedStart.value)); });
     schedEnd.addEventListener('change',  ()=>{ if(schedEnd.value)   queue('schedEnd',  toMin(schedEnd.value)); });
     tzSel.addEventListener('change',()=>queue('tz',tzSel.value));
@@ -935,6 +952,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
       if (d.runMode!==undefined) runBtns.forEach(b=>b.classList.toggle('active',parseInt(b.dataset.run)===d.runMode));
       if (d.runStatus!==undefined){ const rs=document.getElementById('runStatus'); rs.textContent=d.runStatus; rs.classList.toggle('standby',!!d.standbyMode); }
       if (d.schedEnabled!==undefined) schedEn.checked=d.schedEnabled;
+      if (d.weekendStandby!==undefined) weekendEl.checked=d.weekendStandby;
       if (d.schedStart!==undefined && document.activeElement!==schedStart) schedStart.value=toHHMM(d.schedStart);
       if (d.schedEnd!==undefined   && document.activeElement!==schedEnd)   schedEnd.value=toHHMM(d.schedEnd);
       if (d.tz!==undefined && document.activeElement!==tzSel) setTzSelect(d.tz);
@@ -1021,6 +1039,7 @@ static void addRunFields(JsonDocument &doc) {
   doc["schedEnabled"] = schedEnabled;
   doc["schedStart"]   = schedStartMin;
   doc["schedEnd"]     = schedEndMin;
+  doc["weekendStandby"] = weekendStandby;
   doc["tz"]           = tzPosix;
   struct tm t; char clk[6] = "";
   if (localClockValid(&t)) snprintf(clk, sizeof clk, "%02d:%02d", t.tm_hour, t.tm_min);
@@ -1116,6 +1135,7 @@ static void handleSettingsPost() {
   if (!doc["schedEnabled"].isNull()) { schedEnabled  = doc["schedEnabled"].as<bool>(); markSettingsDirty(); }
   if (!doc["schedStart"].isNull())   { schedStartMin = constrain(doc["schedStart"].as<int>(), 0, 1439); markSettingsDirty(); }
   if (!doc["schedEnd"].isNull())     { schedEndMin   = constrain(doc["schedEnd"].as<int>(),   0, 1439); markSettingsDirty(); }
+  if (!doc["weekendStandby"].isNull()) { weekendStandby = doc["weekendStandby"].as<bool>(); markSettingsDirty(); }
   if (!doc["tz"].isNull()) {
     tzPosix = doc["tz"].as<String>().substring(0, 63);
     applyTimezone();
