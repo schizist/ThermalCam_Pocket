@@ -88,6 +88,9 @@ static BlinkPhase    blinkPhase   = BP_IDLE;
 static unsigned long blinkPhaseMs = 0;
 static bool          triggerBlinkFlag = false;
 static int           blinkCount = 0;
+// Blinks waiting to run back-to-back (e.g. the single/double blink on a periodic wake)
+static int           queuedBlinks = 0;
+static const unsigned long QUEUED_BLINK_GAP_MS = 120; // pause between queued blinks
 
 static bool          debugMode              = false;
 static unsigned long normalBlinkIntervalMs  = 60000UL;  // 1 min default in normal mode
@@ -107,9 +110,11 @@ static bool          standbyMode            = false;
 enum RunMode { RUN_ACTIVE = 0, RUN_STANDBY = 1, RUN_PERIODIC = 2 };
 static RunMode       runMode                = RUN_ACTIVE;
 
-// Periodic — alternates random-length rest (standby) and active phases
-static const unsigned long PERIODIC_MIN_MS = 2UL * 60UL * 1000UL;   // 2 min
-static const unsigned long PERIODIC_MAX_MS = 2UL * 3600UL * 1000UL; // 2 hr
+// Periodic — long random rests (standby) broken by brief random bursts of activity
+static const unsigned long PERIODIC_REST_MIN_MS   = 2UL * 60UL * 1000UL;   // 2 min
+static const unsigned long PERIODIC_REST_MAX_MS   = 2UL * 3600UL * 1000UL; // 2 hr
+static const unsigned long PERIODIC_ACTIVE_MIN_MS = 2UL * 1000UL;          // 2 s
+static const unsigned long PERIODIC_ACTIVE_MAX_MS = 6UL * 1000UL;          // 6 s
 static bool          periodicResting        = false;
 static unsigned long periodicPhaseStartMs   = 0;
 static unsigned long periodicPhaseLenMs     = 0;
@@ -137,15 +142,16 @@ static void markSettingsDirty() {
   settingsDirtyMs = millis();
 }
 
-static unsigned long randomPeriodicMs() {
-  return PERIODIC_MIN_MS + esp_random() % (PERIODIC_MAX_MS - PERIODIC_MIN_MS + 1);
+static unsigned long randomBetweenMs(unsigned long lo, unsigned long hi) {
+  return lo + esp_random() % (hi - lo + 1);
 }
 
 static void startPeriodicPhase(bool resting) {
   periodicResting      = resting;
   periodicPhaseStartMs = millis();
-  periodicPhaseLenMs   = randomPeriodicMs();
-  Serial.printf("[PERIODIC] %s for %lu s\n", resting ? "Resting" : "Active", periodicPhaseLenMs / 1000);
+  periodicPhaseLenMs   = resting ? randomBetweenMs(PERIODIC_REST_MIN_MS,   PERIODIC_REST_MAX_MS)
+                                 : randomBetweenMs(PERIODIC_ACTIVE_MIN_MS, PERIODIC_ACTIVE_MAX_MS);
+  Serial.printf("[PERIODIC] %s for %.1f s\n", resting ? "Resting" : "Active", periodicPhaseLenMs / 1000.0f);
 }
 
 static void setRunMode(RunMode m) {
@@ -189,7 +195,15 @@ static void updateStandby() {
   weekendActive = isWeekendNow();
   bool want = schedActive || weekendActive || runMode == RUN_STANDBY || (runMode == RUN_PERIODIC && periodicResting);
   if (want == standbyMode) return;
-  if (!want) blinkPhaseMs = millis(); // avoid an immediate blink from a stale timer on wake
+  if (want) {
+    // Never rest with the lid shut — a short periodic burst can end mid-blink
+    if (blinkPhase != BP_IDLE) servoWrite(BLINK_SERVO_PIN, EYELID_OPEN_DEG);
+    blinkPhase   = BP_IDLE;
+    queuedBlinks = 0;
+  } else {
+    blinkPhaseMs = millis(); // avoid an immediate blink from a stale timer on wake
+    if (runMode == RUN_PERIODIC && !periodicResting) queuedBlinks = 1 + esp_random() % 2; // single or double
+  }
   standbyMode = want;
   Serial.printf("[STANDBY] %s\n", want ? "ON" : "OFF");
 }
@@ -229,6 +243,12 @@ static void startBlink() {
 
 static void updateBlink() {
   unsigned long now = millis();
+
+  if (blinkPhase == BP_IDLE && queuedBlinks > 0 && now - blinkPhaseMs >= QUEUED_BLINK_GAP_MS) {
+    queuedBlinks--;
+    startBlink();
+    return;
+  }
 
   unsigned long activeBlinkInterval = debugMode ? blinkIntervalMs : normalBlinkIntervalMs;
   if (blinkPhase == BP_IDLE && (now - blinkPhaseMs >= activeBlinkInterval)) {

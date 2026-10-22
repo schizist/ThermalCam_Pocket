@@ -90,9 +90,11 @@ as soon as it joins one.
   - **Active:** normal tracking and blinking.
   - **Standby:** pauses all movement. Always comes back up as Active after a
     reboot.
-  - **Periodic:** alternates on its own between standby and active, each for a
-    random 2 minutes to 2 hours, until you pick another mode. The status line
-    counts down to the next switch. Periodic survives a reboot.
+  - **Periodic:** mostly in standby, waking for brief bursts. It rests for a
+    random 2 minutes to 2 hours, wakes for a random 2 to 6 seconds (blinking
+    once or twice, at random, as it wakes), and repeats until you pick
+    another mode. The status line counts down to the
+    next switch. Periodic survives a reboot.
 - **Standby schedule:** tick *Standby every day* and set a From/To time (it can
   wrap past midnight, e.g. 22:00 to 07:00). While the window is open the head
   is in standby, whatever the mode. When it closes, the selected mode resumes.
